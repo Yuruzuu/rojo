@@ -79,7 +79,7 @@ pub fn syncback_loop(
     }
 
     log::debug!("Collecting referents for new DOM...");
-    let deferred_referents = collect_referents(&new_tree);
+    let deferred_referents = collect_referents(&new_tree, old_tree);
 
     // Remove any properties that are manually blocked from syncback via the
     // project file.
@@ -507,7 +507,11 @@ impl SyncbackRules {
     }
 }
 
-fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Path) -> bool {
+pub(crate) fn is_valid_path(
+    globs: &Option<Vec<IgnorableGlob>>,
+    base_path: &Path,
+    path: &Path,
+) -> bool {
     let path = normalize_syncback_path(path);
     let base_path = normalize_syncback_path(base_path);
     let test_path = match path.strip_prefix(base_path.as_ref()) {

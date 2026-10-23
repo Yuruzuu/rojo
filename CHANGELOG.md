@@ -37,7 +37,7 @@ Making a new release? Simply add the new header with the version and date undern
 * Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Syncback preserves ignored descendants when removing a parent directory, including aliased mounts, and protects nested Git directories.
 * Syncback rejects unsafe new directory names and preserves children whose names would otherwise overwrite reserved init files.
-* Syncback updates existing init script files in place and preserves edits to their directory metadata.
+* Syncback updates existing init scripts in place and preserves metadata IDs, settings, and JSONC precedence.
 * Syncback resolves relative root paths from the project folder so newly added root children are not discarded.
 * Syncback avoids rewriting unchanged string attributes imported from Roblox files.
 * Syncback no longer drops small numeric edits or attribute type changes, and handles sequence keypoints with NaN times without panicking while hashing.

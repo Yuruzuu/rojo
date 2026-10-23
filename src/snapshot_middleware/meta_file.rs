@@ -10,7 +10,10 @@ use rbx_dom_weak::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    json, resolution::UnresolvedValue, snapshot::InstanceSnapshot, syncback::SyncbackSnapshot,
+    json,
+    resolution::UnresolvedValue,
+    snapshot::InstanceSnapshot,
+    syncback::{FsSnapshot, SyncbackSnapshot},
     RojoRef,
 };
 
@@ -387,6 +390,72 @@ impl DirectoryMetadata {
         }))
     }
 
+    pub fn write_to_fs_snapshot(
+        &mut self,
+        snapshot: &SyncbackSnapshot,
+        fs_snapshot: &mut FsSnapshot,
+    ) -> anyhow::Result<()> {
+        let json_path = self.path.join("init.meta.json");
+        let jsonc_path = self.path.join("init.meta.jsonc");
+        let has_json = snapshot.vfs().exists(&json_path)?;
+        let has_jsonc = snapshot.vfs().exists(&jsonc_path)?;
+
+        self.id = snapshot.old_inst().and_then(|inst| {
+            inst.metadata()
+                .specified_id
+                .as_ref()
+                .map(ToString::to_string)
+        });
+        for path in [&json_path, &jsonc_path] {
+            if let Some(contents) = snapshot.vfs().read(path).with_not_found()? {
+                let existing = Self::from_slice(&contents, path.clone())?;
+                self.id = existing.id.or(self.id.take());
+                self.schema = existing.schema.or(self.schema.take());
+                self.ignore_unknown_instances = existing
+                    .ignore_unknown_instances
+                    .or(self.ignore_unknown_instances);
+            }
+        }
+
+        if has_json && has_jsonc {
+            let project = snapshot.project();
+            let ignore_patterns = project
+                .syncback_rules
+                .as_ref()
+                .map(|rules| rules.compile_globs())
+                .transpose()?;
+            if [&json_path, &jsonc_path].into_iter().any(|path| {
+                !crate::syncback::is_valid_path(&ignore_patterns, project.folder_location(), path)
+            }) {
+                anyhow::bail!(
+                    "Cannot consolidate init metadata in {} because a metadata path is ignored by syncback",
+                    self.path.display()
+                );
+            }
+        }
+
+        if self.is_empty() && !has_json && !has_jsonc {
+            return Ok(());
+        }
+
+        // JSONC is applied last. Consolidate there so old values cannot reappear
+        // when properties or attributes are removed from the edited instance.
+        let path = if has_jsonc {
+            jsonc_path
+        } else {
+            json_path.clone()
+        };
+        fs_snapshot.add_file(
+            path,
+            serde_json::to_vec_pretty(self).context("could not serialize init metadata")?,
+        );
+        if has_json && has_jsonc {
+            fs_snapshot.remove_file(json_path);
+        }
+
+        Ok(())
+    }
+
     pub fn apply_all(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         self.apply_ignore_unknown_instances(snapshot);
         self.apply_class_name(snapshot)?;
@@ -469,12 +538,15 @@ impl DirectoryMetadata {
     ///
     /// - The number of properties and attributes is 0
     /// - `ignore_unknown_instances` is None
+    /// - `id` and `schema` are None
     /// - `class_name` is either None or not Some("Folder")
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
+            && self.id.is_none()
+            && self.schema.is_none()
             && if let Some(class) = &self.class_name {
                 class == "Folder"
             } else {

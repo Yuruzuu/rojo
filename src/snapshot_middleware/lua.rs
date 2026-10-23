@@ -208,13 +208,7 @@ pub fn syncback_lua_init<'sync>(
         // is fine.
         meta.properties.shift_remove(&ustr("Source"));
 
-        if !meta.is_empty() {
-            dir_syncback.fs_snapshot.add_file(
-                snapshot.path.join("init.meta.json"),
-                serde_json::to_vec_pretty(&meta)
-                    .context("could not serialize new init.meta.json")?,
-            );
-        }
+        meta.write_to_fs_snapshot(snapshot, &mut dir_syncback.fs_snapshot)?;
     }
 
     Ok(dir_syncback)
@@ -225,9 +219,16 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
-    use rbx_dom_weak::{types::Attributes, InstanceBuilder, WeakDom};
+    use rbx_dom_weak::{
+        types::{Attributes, Ref},
+        InstanceBuilder, WeakDom,
+    };
 
-    use crate::{snapshot::RojoTree, syncback::syncback_loop, Project};
+    use crate::{
+        snapshot::{apply_patch_set, compute_patch_set, RojoTree},
+        syncback::syncback_loop,
+        Project,
+    };
 
     fn instance_builder(snapshot: InstanceSnapshot) -> InstanceBuilder {
         InstanceBuilder::new(snapshot.class_name)
@@ -236,21 +237,25 @@ mod test {
             .with_children(snapshot.children.into_iter().map(instance_builder))
     }
 
-    fn syncback_init_fixture(files: VfsSnapshot, edit: impl FnOnce(&mut InstanceSnapshot)) -> Vfs {
+    fn init_vfs_fixture(files: VfsSnapshot, project: &str) -> Vfs {
         let mut imfs = InMemoryFs::new();
         imfs.load_snapshot(
             "/project",
             VfsSnapshot::dir([
-                (
-                    "default.project.json",
-                    VfsSnapshot::file(r#"{"emitLegacyScripts":true,"tree":{"$path":"src"}}"#),
-                ),
+                ("default.project.json", VfsSnapshot::file(project)),
                 ("src", files),
             ]),
         )
         .unwrap();
 
-        let vfs = Vfs::new(imfs);
+        Vfs::new(imfs)
+    }
+
+    fn syncback_init_fixture(files: VfsSnapshot, edit: impl FnOnce(&mut InstanceSnapshot)) -> Vfs {
+        let vfs = init_vfs_fixture(
+            files,
+            r#"{"emitLegacyScripts":true,"tree":{"$path":"src"}}"#,
+        );
         let project_path = Path::new("/project/default.project.json");
         let project = Project::load_exact(&vfs, project_path, None).unwrap();
         let snapshot =
@@ -268,6 +273,356 @@ mod test {
             .unwrap();
 
         vfs
+    }
+
+    fn rebuild_project(vfs: &Vfs) -> RojoTree {
+        let snapshot = super::super::snapshot_from_vfs(
+            &InstanceContext::default(),
+            vfs,
+            Path::new("/project/default.project.json"),
+        )
+        .unwrap();
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let patch = compute_patch_set(snapshot, &tree, root);
+        apply_patch_set(&mut tree, patch);
+
+        tree
+    }
+
+    fn dom_builder(dom: &WeakDom, referent: Ref) -> InstanceBuilder {
+        let inst = dom.get_by_ref(referent).unwrap();
+        InstanceBuilder::new(inst.class)
+            .with_referent(referent)
+            .with_name(inst.name.clone())
+            .with_properties(inst.properties.clone())
+            .with_children(inst.children().iter().map(|child| dom_builder(dom, *child)))
+    }
+
+    fn syncback_rebuilt_project(
+        vfs: &Vfs,
+        edit: impl FnOnce(&mut WeakDom),
+    ) -> anyhow::Result<FsSnapshot> {
+        let mut old_tree = rebuild_project(vfs);
+        let mut new_tree = WeakDom::new(dom_builder(old_tree.inner(), old_tree.get_root_id()));
+        edit(&mut new_tree);
+        let project =
+            Project::load_exact(vfs, Path::new("/project/default.project.json"), None).unwrap();
+
+        syncback_loop(vfs, &mut old_tree, new_tree, &project)
+    }
+
+    fn named_child(dom: &WeakDom, name: &str) -> Ref {
+        *dom.root()
+            .children()
+            .iter()
+            .find(|referent| dom.get_by_ref(**referent).unwrap().name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn syncback_init_preserves_manual_id_and_ignored_reference() {
+        for metadata in [
+            r#"{"id":"worker"}"#,
+            r#"{"id":"worker","$schema":"https://example.com/init.schema.json"}"#,
+        ] {
+            for include_active_pointer in [false, true] {
+                let pointer =
+                    r#"{"className":"ObjectValue","attributes":{"Rojo_Target_Value":"worker"}}"#;
+                let vfs = init_vfs_fixture(
+                    VfsSnapshot::dir([
+                        (
+                            "Worker",
+                            VfsSnapshot::dir([
+                                ("init.luau", VfsSnapshot::file("return 'before'")),
+                                ("init.meta.json", VfsSnapshot::file(metadata)),
+                            ]),
+                        ),
+                        ("Ignored.model.json", VfsSnapshot::file(pointer)),
+                    ]),
+                    r#"{"tree":{"$path":"src"},"syncbackRules":{"ignorePaths":["src/Ignored.model.json"]}}"#,
+                );
+                let fs_snapshot = syncback_rebuilt_project(&vfs, |dom| {
+                    let ignored = named_child(dom, "Ignored");
+                    dom.destroy(ignored);
+                    let worker = named_child(dom, "Worker");
+                    dom.get_by_ref_mut(worker)
+                        .unwrap()
+                        .properties
+                        .insert(ustr("Source"), "return 'after'".into());
+                    if include_active_pointer {
+                        dom.insert(
+                            dom.root_ref(),
+                            InstanceBuilder::new("ObjectValue")
+                                .with_name("Active")
+                                .with_property("Value", Variant::Ref(worker)),
+                        );
+                    } else {
+                        let mut attributes = Attributes::new();
+                        attributes.insert("Rojo_Id".into(), "stale".into());
+                        dom.get_by_ref_mut(worker)
+                            .unwrap()
+                            .properties
+                            .insert(ustr("Attributes"), attributes.into());
+                    }
+                })
+                .unwrap();
+                fs_snapshot
+                    .write_to_vfs(Path::new("/project"), &vfs)
+                    .unwrap();
+
+                let actual: serde_json::Value = serde_json::from_slice(
+                    &vfs.read(Path::new("/project/src/Worker/init.meta.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                let expected: serde_json::Value = serde_json::from_str(metadata).unwrap();
+                assert_eq!(actual["id"], "worker");
+                assert_eq!(actual.get("$schema"), expected.get("$schema"));
+                assert_eq!(actual["attributes"]["Rojo_Id"], "worker");
+                assert_eq!(
+                    vfs.read_to_string(Path::new("/project/src/Worker/init.luau"))
+                        .unwrap()
+                        .as_str(),
+                    "return 'after'"
+                );
+                assert_eq!(
+                    vfs.read_to_string(Path::new("/project/src/Ignored.model.json"))
+                        .unwrap()
+                        .as_str(),
+                    pointer
+                );
+                if include_active_pointer {
+                    let active: serde_json::Value = serde_json::from_slice(
+                        &vfs.read(Path::new("/project/src/Active.model.json"))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(active["attributes"]["Rojo_Target_Value"], "worker");
+                }
+
+                let rebuilt = rebuild_project(&vfs);
+                let worker = named_child(rebuilt.inner(), "Worker");
+                for pointer_name in if include_active_pointer {
+                    vec!["Ignored", "Active"]
+                } else {
+                    vec!["Ignored"]
+                } {
+                    let pointer = rebuilt
+                        .get_instance(named_child(rebuilt.inner(), pointer_name))
+                        .unwrap();
+                    assert_eq!(
+                        pointer.properties().get(&ustr("Value")),
+                        Some(&Variant::Ref(worker))
+                    );
+                }
+                assert!(syncback_rebuilt_project(&vfs, |_| {}).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn syncback_init_updates_effective_jsonc_metadata() {
+        for include_json in [false, true] {
+            let mut files = vec![
+                ("init.luau", VfsSnapshot::file("return 'before'")),
+                (
+                    "init.meta.jsonc",
+                    VfsSnapshot::file(
+                        r#"{
+                    // This file takes precedence over JSON.
+                    "$schema":"https://example.com/init.schema.json",
+                    "id":"worker",
+                    "ignoreUnknownInstances":false,
+                    "properties":{"Archivable":false},
+                    "attributes":{"State":"jsonc","Removed":true}
+                }"#,
+                    ),
+                ),
+            ];
+            if include_json {
+                files.push((
+                    "init.meta.json",
+                    VfsSnapshot::file(
+                        r#"{
+                    "ignoreUnknownInstances":true,
+                    "properties":{"Archivable":false},
+                    "attributes":{"State":"json","Shadowed":true}
+                }"#,
+                    ),
+                ));
+            }
+            let vfs = syncback_init_fixture(
+                VfsSnapshot::dir([("Worker", VfsSnapshot::dir(files))]),
+                |snapshot| {
+                    let worker = &mut snapshot.children[0];
+                    worker
+                        .properties
+                        .insert(ustr("Source"), "return 'after'".into());
+                    worker.properties.insert(ustr("Archivable"), true.into());
+                    let mut attributes = Attributes::new();
+                    attributes.insert("State".into(), "after".into());
+                    worker
+                        .properties
+                        .insert(ustr("Attributes"), attributes.into());
+                },
+            );
+            let meta_path = Path::new("/project/src/Worker/init.meta.jsonc");
+            let contents = vfs.read(meta_path).unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+            assert!(!vfs
+                .exists(Path::new("/project/src/Worker/init.meta.json"))
+                .unwrap());
+            assert_eq!(actual["id"], "worker");
+            assert_eq!(actual["$schema"], "https://example.com/init.schema.json");
+            assert_eq!(actual["ignoreUnknownInstances"], false);
+            assert!(actual.get("properties").is_none());
+            assert_eq!(actual["attributes"], serde_json::json!({"State":"after"}));
+
+            let rebuilt = rebuild_project(&vfs);
+            let worker = rebuilt
+                .get_instance(named_child(rebuilt.inner(), "Worker"))
+                .unwrap();
+            assert_eq!(
+                worker.metadata().specified_id.as_ref().unwrap().as_str(),
+                "worker"
+            );
+            assert_eq!(
+                worker.metadata().schema.as_deref(),
+                Some("https://example.com/init.schema.json")
+            );
+            assert!(!worker.metadata().ignore_unknown_instances);
+            assert_eq!(
+                worker.properties().get(&ustr("Source")),
+                Some(&Variant::String("return 'after'".into()))
+            );
+            assert!(syncback_rebuilt_project(&vfs, |_| {}).unwrap().is_empty());
+            assert_eq!(vfs.read(meta_path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn syncback_init_clears_defaulted_metadata_and_retains_identity_only_metadata() {
+        for (metadata_name, include_json) in [
+            ("init.meta.json", false),
+            ("init.meta.jsonc", false),
+            ("init.meta.jsonc", true),
+        ] {
+            for retained in [
+                serde_json::json!({}),
+                serde_json::json!({"id":"worker"}),
+                serde_json::json!({"$schema":"https://example.com/init.schema.json"}),
+                serde_json::json!({"id":"worker","$schema":"https://example.com/init.schema.json"}),
+            ] {
+                let mut metadata = retained.clone();
+                metadata["attributes"] = serde_json::json!({"Removed":true});
+                metadata["properties"] = serde_json::json!({"Archivable":false});
+                let mut files = vec![
+                    ("init.luau", VfsSnapshot::file("return 'before'")),
+                    (
+                        metadata_name,
+                        VfsSnapshot::file(serde_json::to_vec(&metadata).unwrap()),
+                    ),
+                ];
+                if include_json {
+                    files.push((
+                        "init.meta.json",
+                        VfsSnapshot::file(
+                            r#"{
+                        "attributes":{"Shadowed":true},
+                        "properties":{"Archivable":false}
+                    }"#,
+                        ),
+                    ));
+                }
+                let vfs = syncback_init_fixture(
+                    VfsSnapshot::dir([("Worker", VfsSnapshot::dir(files))]),
+                    |snapshot| {
+                        let worker = &mut snapshot.children[0];
+                        worker
+                            .properties
+                            .insert(ustr("Source"), "return 'after'".into());
+                        worker.properties.remove(&ustr("Attributes"));
+                        worker.properties.insert(ustr("Archivable"), true.into());
+                    },
+                );
+                let actual: serde_json::Value = serde_json::from_slice(
+                    &vfs.read(Path::new("/project/src/Worker").join(metadata_name))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(actual, retained);
+                if include_json {
+                    assert!(!vfs
+                        .exists(Path::new("/project/src/Worker/init.meta.json"))
+                        .unwrap());
+                }
+                let rebuilt = rebuild_project(&vfs);
+                let worker = rebuilt
+                    .get_instance(named_child(rebuilt.inner(), "Worker"))
+                    .unwrap();
+                assert!(!worker.properties().contains_key(&ustr("Attributes")));
+                assert_ne!(
+                    worker.properties().get(&ustr("Archivable")),
+                    Some(&Variant::Bool(false))
+                );
+                assert!(syncback_rebuilt_project(&vfs, |_| {}).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn syncback_init_refuses_consolidation_with_ignored_metadata() {
+        for ignored_name in ["init.meta.json", "init.meta.jsonc"] {
+            let project = serde_json::json!({
+                "tree":{"$path":"src"},
+                "syncbackRules":{"ignorePaths":[format!("src/Worker/{ignored_name}")]}
+            });
+            let vfs = init_vfs_fixture(
+                VfsSnapshot::dir([(
+                    "Worker",
+                    VfsSnapshot::dir([
+                        ("init.luau", VfsSnapshot::file("return 'before'")),
+                        (
+                            "init.meta.json",
+                            VfsSnapshot::file(r#"{"attributes":{"State":"json"}}"#),
+                        ),
+                        (
+                            "init.meta.jsonc",
+                            VfsSnapshot::file(
+                                r#"{"id":"worker","$schema":"https://example.com/init.schema.json","attributes":{"State":"jsonc"}}"#,
+                            ),
+                        ),
+                    ]),
+                )]),
+                &project.to_string(),
+            );
+            let result = syncback_rebuilt_project(&vfs, |dom| {
+                let worker = named_child(dom, "Worker");
+                dom.get_by_ref_mut(worker)
+                    .unwrap()
+                    .properties
+                    .insert(ustr("Source"), "return 'after'".into());
+            });
+            let error = result
+                .err()
+                .expect("ignored metadata must block consolidation");
+            assert!(error
+                .to_string()
+                .contains("a metadata path is ignored by syncback"));
+            assert_eq!(
+                vfs.read_to_string(Path::new("/project/src/Worker/init.luau"))
+                    .unwrap()
+                    .as_str(),
+                "return 'before'"
+            );
+            assert!(vfs
+                .exists(Path::new("/project/src/Worker/init.meta.json"))
+                .unwrap());
+            assert!(vfs
+                .exists(Path::new("/project/src/Worker/init.meta.jsonc"))
+                .unwrap());
+        }
     }
 
     #[test]
