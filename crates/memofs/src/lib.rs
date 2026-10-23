@@ -82,6 +82,12 @@ pub trait VfsBackend: sealed::Sealed + Send + 'static {
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent>;
     fn watch(&mut self, path: &Path) -> io::Result<()>;
     fn unwatch(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Release watches after a removal event, unless the backend can continue
+    /// watching for the removed path to be recreated.
+    fn unwatch_removed(&mut self, path: &Path) -> io::Result<()> {
+        self.unwatch(path)
+    }
 }
 
 /// Vfs equivalent to [`std::fs::DirEntry`][std::fs::DirEntry].
@@ -237,7 +243,7 @@ impl VfsInner {
 
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
         if let VfsEvent::Remove(path) = event {
-            let _ = self.backend.unwatch(path);
+            let _ = self.backend.unwatch_removed(path);
         }
 
         Ok(())
@@ -587,6 +593,125 @@ mod test {
     use crate::{InMemoryFs, StdBackend, Vfs, VfsSnapshot};
     use std::io;
     use std::path::PathBuf;
+
+    #[cfg(windows)]
+    fn receive_and_commit_event(
+        vfs: &Vfs,
+        receiver: &crossbeam_channel::Receiver<crate::VfsEvent>,
+        description: &str,
+        expected: impl Fn(&crate::VfsEvent) -> bool,
+    ) {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| panic!("timed out waiting for {}", description));
+            let event = receiver
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("waiting for {}: {}", description, error));
+            vfs.commit_event(&event).unwrap();
+
+            if expected(&event) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn std_backend_file_watch_survives_delete_recreate() {
+        use crate::VfsEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped.luau");
+        fs_err::write(&path, "return 0").unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        let receiver = vfs.event_receiver();
+        assert_eq!(vfs.read_to_string(&path).unwrap().as_str(), "return 0");
+
+        for revision in 1..=2 {
+            fs_err::remove_file(&path).unwrap();
+            receive_and_commit_event(
+                &vfs,
+                &receiver,
+                "file removal",
+                |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &path),
+            );
+
+            fs_err::write(&path, "recreated").unwrap();
+            receive_and_commit_event(
+                &vfs,
+                &receiver,
+                "file recreation",
+                |event| matches!(event, VfsEvent::Create(event_path) if event_path == &path),
+            );
+
+            fs_err::write(&path, format!("return {}", revision)).unwrap();
+            receive_and_commit_event(
+                &vfs,
+                &receiver,
+                "subsequent file write",
+                |event| matches!(event, VfsEvent::Write(event_path) if event_path == &path),
+            );
+        }
+
+        assert_eq!(vfs.read_to_string(&path).unwrap().as_str(), "return 2");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn std_backend_file_watch_can_become_recursive_directory() {
+        use crate::VfsEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped");
+        fs_err::write(&path, "contents").unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        let receiver = vfs.event_receiver();
+        vfs.read(&path).unwrap();
+
+        fs_err::remove_file(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "file removal",
+            |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &path),
+        );
+
+        fs_err::create_dir(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "directory creation",
+            |event| matches!(event, VfsEvent::Create(event_path) if event_path == &path),
+        );
+
+        let nested = path.join("nested");
+        fs_err::create_dir(&nested).unwrap();
+        vfs.read_dir(&path).unwrap();
+
+        let child = nested.join("child.luau");
+        fs_err::write(&child, "return 1").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "nested file creation",
+            |event| matches!(event, VfsEvent::Create(event_path) if event_path == &child),
+        );
+
+        fs_err::write(&child, "return 2").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "nested file write",
+            |event| matches!(event, VfsEvent::Write(event_path) if event_path == &child),
+        );
+    }
 
     /// https://github.com/rojo-rbx/rojo/issues/899
     #[test]

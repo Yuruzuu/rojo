@@ -8,6 +8,7 @@ Use the following format:
 ```
 ## Unreleased
 
+* On Windows, live sync continues after a directly mapped file is deleted and recreated, and failed watch registrations remain retryable.
 * Live sync subscriptions cannot miss a change published while the subscription is being registered.
 * Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Made a change to Rojo ([#0000])
