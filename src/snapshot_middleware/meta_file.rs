@@ -434,7 +434,8 @@ impl DirectoryMetadata {
             }
         }
 
-        if self.is_empty() && !has_json && !has_jsonc {
+        if self.is_empty() && self.id.is_none() && self.schema.is_none() && !has_json && !has_jsonc
+        {
             return Ok(());
         }
 
@@ -538,15 +539,12 @@ impl DirectoryMetadata {
     ///
     /// - The number of properties and attributes is 0
     /// - `ignore_unknown_instances` is None
-    /// - `id` and `schema` are None
     /// - `class_name` is either None or not Some("Folder")
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
-            && self.id.is_none()
-            && self.schema.is_none()
             && if let Some(class) = &self.class_name {
                 class == "Folder"
             } else {

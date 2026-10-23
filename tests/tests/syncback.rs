@@ -309,3 +309,77 @@ fn ignored_descendants_survive_removal_of_their_parent() {
         assert!(!removed.join("Nested").exists());
     }
 }
+
+#[test]
+fn schema_only_jsonc_folder_remains_buildable_after_child_edit() {
+    use std::process::Command;
+
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use tempfile::tempdir;
+
+    use crate::rojo_test::io_util::ROJO_PATH;
+
+    let directory = tempdir().unwrap();
+    let project = directory.path().join("default.project.json");
+    let folder = directory.path().join("src/Ordinary");
+    let input = directory.path().join("input.rbxmx");
+    fs_err::create_dir_all(&folder).unwrap();
+    fs_err::write(&project, r#"{"name":"Root","tree":{"$path":"src"}}"#).unwrap();
+    let metadata = r#"{"$schema":"https://example.com/folder.schema.json"}"#;
+    fs_err::write(folder.join("init.meta.jsonc"), metadata).unwrap();
+    fs_err::write(folder.join("Child.luau"), "return 'before'").unwrap();
+    let dom = WeakDom::new(
+        InstanceBuilder::new("Folder").with_name("Root").with_child(
+            InstanceBuilder::new("Folder")
+                .with_name("Ordinary")
+                .with_child(
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Child")
+                        .with_property("Source", "return 'after'"),
+                ),
+        ),
+    );
+    rbx_xml::to_writer_default(
+        fs_err::File::create(&input).unwrap(),
+        &dom,
+        &[dom.root_ref()],
+    )
+    .unwrap();
+
+    let output = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&project)
+        .arg("--input")
+        .arg(&input)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!folder.join("init.meta.json").exists());
+    assert_eq!(
+        fs_err::read_to_string(folder.join("init.meta.jsonc")).unwrap(),
+        metadata
+    );
+    assert_eq!(
+        fs_err::read_to_string(folder.join("Child.luau")).unwrap(),
+        "return 'after'"
+    );
+    let rebuilt = directory.path().join("rebuilt.rbxmx");
+    let output = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&project)
+        .arg("--output")
+        .arg(&rebuilt)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
