@@ -395,13 +395,8 @@ impl DirectoryMetadata {
         snapshot: &SyncbackSnapshot,
         fs_snapshot: &mut FsSnapshot,
     ) -> anyhow::Result<()> {
-        let directory = snapshot
-            .vfs()
-            .canonicalize(&self.path)
-            .with_not_found()?
-            .unwrap_or_else(|| self.path.clone());
-        let json_path = directory.join("init.meta.json");
-        let jsonc_path = directory.join("init.meta.jsonc");
+        let json_path = self.path.join("init.meta.json");
+        let jsonc_path = self.path.join("init.meta.jsonc");
         let has_json = snapshot.vfs().exists(&json_path)?;
         let has_jsonc = snapshot.vfs().exists(&jsonc_path)?;
 
@@ -423,15 +418,25 @@ impl DirectoryMetadata {
         }
 
         if has_json && has_jsonc {
+            let directory = snapshot.vfs().canonicalize(&self.path)?;
+            let canonical_json = directory.join("init.meta.json");
+            let canonical_jsonc = directory.join("init.meta.jsonc");
             let project = snapshot.project();
             let ignore_patterns = project
                 .syncback_rules
                 .as_ref()
                 .map(|rules| rules.compile_globs())
                 .transpose()?;
-            if [&json_path, &jsonc_path].into_iter().any(|path| {
-                !crate::syncback::is_valid_path(&ignore_patterns, project.folder_location(), path)
-            }) {
+            if [&json_path, &jsonc_path, &canonical_json, &canonical_jsonc]
+                .into_iter()
+                .any(|path| {
+                    !crate::syncback::is_valid_path(
+                        &ignore_patterns,
+                        project.folder_location(),
+                        path,
+                    )
+                })
+            {
                 anyhow::bail!(
                     "Cannot consolidate init metadata in {} because a metadata path is ignored by syncback",
                     self.path.display()
