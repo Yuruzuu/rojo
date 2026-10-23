@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::Parser;
 use fs_err::File;
 use memofs::Vfs;
-use rbx_dom_weak::{InstanceBuilder, WeakDom};
+use rbx_dom_weak::{types::Ref, WeakDom};
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::{
@@ -185,29 +185,18 @@ fn read_dom(path: &Path, file_kind: FileKind) -> anyhow::Result<WeakDom> {
     }
 }
 
-fn process_model_dom(dom: WeakDom) -> anyhow::Result<WeakDom> {
-    let temp_children = dom.root().children();
-    if temp_children.len() == 1 {
-        let real_root = dom.get_by_ref(temp_children[0]).unwrap();
-        let mut new_tree = WeakDom::new(InstanceBuilder::new(real_root.class));
-        for (name, property) in &real_root.properties {
-            new_tree
-                .root_mut()
-                .properties
-                .insert(*name, property.to_owned());
-        }
+fn process_model_dom(mut dom: WeakDom) -> anyhow::Result<WeakDom> {
+    let [real_root] = *dom.root().children() else {
+        anyhow::bail!("Rojo requires models to contain exactly one Instance at the root.");
+    };
 
-        let children = dom.clone_multiple_into_external(real_root.children(), &mut new_tree);
-        for child in children {
-            new_tree.transfer_within(child, new_tree.root_ref());
-        }
-        Ok(new_tree)
-    } else {
-        anyhow::bail!(
-            "Rojo does not currently support models with more \
-        than one Instance at the Root!"
-        );
-    }
+    // Re-root without cloning so references between the model and its children
+    // keep pointing to the same instances.
+    dom.transfer_within(real_root, Ref::none());
+    let (container, mut instances) = dom.into_raw();
+    instances.remove(&container);
+
+    Ok(WeakDom::from_raw(real_root, instances))
 }
 
 fn xml_decode_config() -> rbx_xml::DecodeOptions<'static> {
@@ -279,4 +268,73 @@ fn list_files(snapshot: &FsSnapshot, color: ColorChoice, base_path: &Path) -> io
     buffer.set_color(&no_color)?;
 
     writer.print(&buffer)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rbx_dom_weak::{types::Variant, InstanceBuilder};
+
+    #[test]
+    fn model_root_keeps_its_name() {
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel")
+                .with_child(InstanceBuilder::new("Model").with_name("CharacterRig")),
+        );
+
+        let model = process_model_dom(dom).unwrap();
+
+        assert_eq!(model.root().name, "CharacterRig");
+        assert_eq!(model.root().parent(), Ref::none());
+        assert_eq!(model.descendants().count(), 1);
+    }
+
+    #[test]
+    fn model_root_keeps_references_in_both_directions() {
+        let model_ref = Ref::new();
+        let part_ref = Ref::new();
+        let pointer_ref = Ref::new();
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Model")
+                    .with_referent(model_ref)
+                    .with_property("PrimaryPart", part_ref)
+                    .with_child(InstanceBuilder::new("Part").with_referent(part_ref))
+                    .with_child(
+                        InstanceBuilder::new("ObjectValue")
+                            .with_referent(pointer_ref)
+                            .with_property("Value", model_ref),
+                    ),
+            ),
+        );
+
+        let model = process_model_dom(dom).unwrap();
+
+        assert_eq!(
+            model.root().properties.get(&"PrimaryPart".into()),
+            Some(&Variant::Ref(part_ref))
+        );
+        assert!(model.get_by_ref(part_ref).is_some());
+        assert_eq!(
+            model
+                .get_by_ref(pointer_ref)
+                .unwrap()
+                .properties
+                .get(&"Value".into()),
+            Some(&Variant::Ref(model.root_ref()))
+        );
+        assert_eq!(model.descendants().count(), 3);
+    }
+
+    #[test]
+    fn model_requires_exactly_one_root() {
+        for children in [0, 2] {
+            let dom = WeakDom::new(
+                InstanceBuilder::new("DataModel")
+                    .with_children((0..children).map(|_| InstanceBuilder::new("Model"))),
+            );
+
+            assert!(process_model_dom(dom).is_err());
+        }
+    }
 }

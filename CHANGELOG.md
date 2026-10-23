@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Syncback preserves model root names and references between model roots and their descendants.
 * LocalizationTables no longer report as changed when nothing changes. [(#1333)]
 * Fixed `rojo serve` crashing when queued filesystem events refer to paths whose ancestors have already been removed. ([#1314])
 
