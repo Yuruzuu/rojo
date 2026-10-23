@@ -13,6 +13,80 @@ use crate::rojo_test::{
 use librojo::web_api::{SerializeResponse, SocketPacketType};
 
 #[test]
+fn recursive_delete_rename_and_recreate_keeps_syncing() {
+    use librojo::web_api::ReadResponse;
+    use rbx_dom_weak::types::Variant;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    run_serve_test("scripts", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let wait_for = |predicate: &dyn Fn(&ReadResponse<'_>) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let response = session.get_api_read(info.root_instance_id).unwrap();
+                assert_eq!(response.session_id, info.session_id, "server restarted");
+                if predicate(&response) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "live tree did not converge");
+                thread::sleep(Duration::from_millis(25));
+            }
+        };
+        let src = session.path().join("src");
+        let original = src.join("SwimmingController");
+        let renamed = src.join("RenamedController");
+
+        for cycle in 0..10 {
+            for index in 0..60 {
+                let child = original.join(format!("Group{index}/Deep"));
+                fs::create_dir_all(&child).unwrap();
+                fs::write(child.join(format!("Probe{index}.luau")), "return 1").unwrap();
+            }
+            wait_for(&|response| {
+                response
+                    .instances
+                    .values()
+                    .filter(|instance| instance.name.starts_with("Probe"))
+                    .count()
+                    == 60
+            });
+
+            fs::rename(&original, &renamed).unwrap();
+            wait_for(&|response| {
+                response
+                    .instances
+                    .values()
+                    .any(|instance| instance.name == "RenamedController")
+                    && !response
+                        .instances
+                        .values()
+                        .any(|instance| instance.name == "SwimmingController")
+            });
+
+            // Remove parents before their queued child events can all be processed.
+            fs::remove_dir_all(&renamed).unwrap();
+            wait_for(&|response| {
+                !response.instances.values().any(|instance| {
+                    instance.name.starts_with("Probe") || instance.name == "RenamedController"
+                })
+            });
+
+            let source = format!("return {cycle}");
+            fs::write(src.join("Sentinel.luau"), &source).unwrap();
+            wait_for(&|response| {
+                response.instances.values().any(|instance| {
+                instance.name == "Sentinel" && instance.properties.get(&"Source".into())
+                    .is_some_and(|value| matches!(value.as_ref(), Variant::String(text) if text == &source))
+            })
+            });
+        }
+    });
+}
+
+#[test]
 fn rejects_dns_rebinding_requests() {
     run_serve_test("empty", |session, _redactions| {
         let port = session.port();

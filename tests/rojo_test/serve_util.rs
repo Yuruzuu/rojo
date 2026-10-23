@@ -103,7 +103,8 @@ impl TestServeSession {
         let port = get_port_number();
         let port_string = port.to_string();
 
-        let rojo_process = Command::new(ROJO_PATH)
+        let executable = std::env::var_os("ROJO_TEST_EXE").unwrap_or_else(|| ROJO_PATH.into());
+        let rojo_process = Command::new(executable)
             .args([
                 "serve",
                 project_path.to_str().unwrap(),
