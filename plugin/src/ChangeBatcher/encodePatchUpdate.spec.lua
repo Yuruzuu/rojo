@@ -1,4 +1,5 @@
 return function()
+	-- Services
 	local encodePatchUpdate = require(script.Parent.encodePatchUpdate)
 
 	it("should return an update when there are property changes", function()
@@ -35,6 +36,51 @@ return function()
 		local update = encodePatchUpdate(part, "PART", properties)
 
 		expect(update.changedName).to.equal("We'reGettingToTheCoolPart")
+	end)
+
+	it("should return nil when a reference property cannot be encoded", function()
+		local Reference = Instance.new("ObjectValue")
+		local Target = Instance.new("Folder")
+
+		Reference.Value = Target
+
+		local Update = encodePatchUpdate(Reference, "REFERENCE", { Value = true })
+
+		expect(Update).to.equal(nil)
+
+		Reference:Destroy()
+		Target:Destroy()
+	end)
+
+	it("should preserve a rename when a reference property cannot be encoded", function()
+		local Reference = Instance.new("ObjectValue")
+		local Target = Instance.new("Folder")
+
+		Reference.Value = Target
+		Reference.Name = "RenamedReference"
+
+		local Update = encodePatchUpdate(Reference, "REFERENCE", { Value = true, Name = true })
+
+		expect(Update.id).to.equal("REFERENCE")
+		expect(Update.changedName).to.equal("RenamedReference")
+		expect(next(Update.changedProperties)).to.equal(nil)
+
+		Reference:Destroy()
+		Target:Destroy()
+	end)
+
+	it("should preserve a rename alongside a malformed property name", function()
+		local Part = Instance.new("Part")
+
+		Part.Name = "RenamedPart"
+
+		local Update = encodePatchUpdate(Part, "PART", { NonExistentProperty = true, Name = true })
+
+		expect(Update.id).to.equal("PART")
+		expect(Update.changedName).to.equal("RenamedPart")
+		expect(next(Update.changedProperties)).to.equal(nil)
+
+		Part:Destroy()
 	end)
 
 	it("should correctly encode property values", function()
