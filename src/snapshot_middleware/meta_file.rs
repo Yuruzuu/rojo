@@ -395,8 +395,13 @@ impl DirectoryMetadata {
         snapshot: &SyncbackSnapshot,
         fs_snapshot: &mut FsSnapshot,
     ) -> anyhow::Result<()> {
-        let json_path = self.path.join("init.meta.json");
-        let jsonc_path = self.path.join("init.meta.jsonc");
+        let directory = snapshot
+            .vfs()
+            .canonicalize(&self.path)
+            .with_not_found()?
+            .unwrap_or_else(|| self.path.clone());
+        let json_path = directory.join("init.meta.json");
+        let jsonc_path = directory.join("init.meta.jsonc");
         let has_json = snapshot.vfs().exists(&json_path)?;
         let has_jsonc = snapshot.vfs().exists(&jsonc_path)?;
 

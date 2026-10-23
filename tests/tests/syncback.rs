@@ -383,3 +383,76 @@ fn schema_only_jsonc_folder_remains_buildable_after_child_edit() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn case_aliased_init_metadata_respects_ignored_paths() {
+    use std::process::Command;
+
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use tempfile::tempdir;
+
+    use crate::rojo_test::io_util::ROJO_PATH;
+
+    for ignored_name in ["init.meta.json", "init.meta.jsonc"] {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        let worker = directory.path().join("src/Worker");
+        let input = directory.path().join("input.rbxmx");
+        fs_err::create_dir_all(&worker).unwrap();
+        fs_err::write(
+            &project,
+            serde_json::to_vec(&serde_json::json!({
+                "name":"Root", "tree":{"$path":"SRC"},
+                "syncbackRules":{"ignorePaths":[format!("src/Worker/{ignored_name}")]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let json = r#"{"attributes":{"State":"json"}}"#;
+        let jsonc = r#"{"id":"worker","$schema":"https://example.com/init.schema.json","attributes":{"State":"jsonc"}}"#;
+        fs_err::write(worker.join("init.meta.json"), json).unwrap();
+        fs_err::write(worker.join("init.meta.jsonc"), jsonc).unwrap();
+        fs_err::write(worker.join("init.luau"), "return 'before'").unwrap();
+        let dom = WeakDom::new(
+            InstanceBuilder::new("Folder").with_name("Root").with_child(
+                InstanceBuilder::new("ModuleScript")
+                    .with_name("Worker")
+                    .with_property("Source", "return 'after'"),
+            ),
+        );
+        rbx_xml::to_writer_default(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            &[dom.root_ref()],
+        )
+        .unwrap();
+
+        let output = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&project)
+            .arg("--input")
+            .arg(&input)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "ignored metadata must prevent consolidation"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("a metadata path is ignored"));
+        assert_eq!(
+            fs_err::read_to_string(worker.join("init.meta.json")).unwrap(),
+            json
+        );
+        assert_eq!(
+            fs_err::read_to_string(worker.join("init.meta.jsonc")).unwrap(),
+            jsonc
+        );
+        assert_eq!(
+            fs_err::read_to_string(worker.join("init.luau")).unwrap(),
+            "return 'before'"
+        );
+    }
+}
