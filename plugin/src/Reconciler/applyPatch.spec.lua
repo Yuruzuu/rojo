@@ -102,7 +102,8 @@ return function()
 			local Started, Replacement, Source = coroutine.resume(PatchThread, Fixture.KnownInstances, Fixture.Patch)
 			assert(Started, tostring(Replacement))
 			expect(coroutine.status(PatchThread)).to.equal("suspended")
-			expect(Source).to.equal(Fixture.Patch.updated[1].changedProperties.Source.String)
+			local ReplacementUpdate = Fixture.ReplacementUpdate or Fixture.Patch.updated[1]
+			expect(Source).to.equal(ReplacementUpdate.changedProperties.Source.String)
 			expect(Replacement.Parent).to.equal(nil)
 			expect(#Replacement:GetChildren()).to.equal(0)
 			expect(Fixture.Root.Parent).to.equal(container)
@@ -438,6 +439,39 @@ return function()
 
 		KnownInstances:stop()
 		Root:Destroy()
+	end)
+
+	it("should not apply earlier deferred references after stop during source initialization", function()
+		local Fixture = NewScriptReplacement()
+		Fixture.ReplacementUpdate = Fixture.Patch.updated[1]
+
+		local Target = Instance.new("Folder")
+		Target.Parent = Fixture.Root
+
+		local Value = Instance.new("ObjectValue")
+		Value.Value = Target
+		Value.Parent = Fixture.Root
+		Fixture.KnownInstances:insert("TARGET", Target)
+		Fixture.KnownInstances:insert("VALUE", Value)
+		table.insert(Fixture.Patch.updated, 1, {
+			id = "VALUE",
+			changedProperties = { Value = { Ref = "00000000000000000000000000000000" } },
+		})
+
+		WithPendingSourceInitialization(Fixture, function(PatchThread)
+			Fixture.KnownInstances:stop()
+
+			local Completed, Unapplied = coroutine.resume(PatchThread, true)
+			assert(Completed, tostring(Unapplied))
+			expect(coroutine.status(PatchThread)).to.equal("dead")
+			expect(Value.Value).to.equal(Target)
+			expect(Value.Parent).to.equal(Fixture.Root)
+			expect(Fixture.Root.Parent).to.equal(container)
+			expect(Fixture.Root.Source).to.equal(Fixture.Source)
+			expect(Fixture.Child.Parent).to.equal(Fixture.Root)
+			expect(Fixture.KnownInstances:size()).to.equal(0)
+			expect(#Unapplied.updated).to.equal(2)
+		end)
 	end)
 
 	it("should publish a replacement only after delayed source initialization succeeds", function()

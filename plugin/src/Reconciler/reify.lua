@@ -155,6 +155,12 @@ function applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
 	end
 
 	for _, entry in deferredRefs do
+		-- Source initialization can yield while this instance is unmapped or replaced.
+		if instanceMap.fromIds[entry.id] ~= entry.instance then
+			markFailed(entry.id, entry.propertyName, entry.virtualValue)
+			continue
+		end
+
 		local DecodeSuccess, TargetInstance = decodeValue(entry.virtualValue, instanceMap)
 		if not DecodeSuccess then
 			markFailed(entry.id, entry.propertyName, entry.virtualValue)
