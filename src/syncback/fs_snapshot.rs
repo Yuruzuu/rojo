@@ -107,8 +107,12 @@ impl FsSnapshot {
             return Ok(true);
         }
 
-        // Selective removal must not follow directory links into another tree.
-        if vfs.canonicalize(path)? != path {
+        // Normalize the parent separately so `..` mounts remain valid while
+        // directory links discovered during traversal are left untouched.
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Ok(false);
+        };
+        if vfs.canonicalize(path)? != vfs.canonicalize(parent)?.join(name) {
             return Ok(false);
         }
 
@@ -238,15 +242,18 @@ mod test {
         let mut backend = InMemoryFs::new();
         backend
             .load_snapshot(
-                "/project/Gone",
-                VfsSnapshot::dir([
-                    ("keep.luau", VfsSnapshot::file("return 'keep'")),
-                    ("drop.luau", VfsSnapshot::file("return 'drop'")),
-                    (
-                        "Nested",
-                        VfsSnapshot::dir([("drop.luau", VfsSnapshot::file("return 'nested'"))]),
-                    ),
-                ]),
+                "/project",
+                VfsSnapshot::dir([(
+                    "Gone",
+                    VfsSnapshot::dir([
+                        ("keep.luau", VfsSnapshot::file("return 'keep'")),
+                        ("drop.luau", VfsSnapshot::file("return 'drop'")),
+                        (
+                            "Nested",
+                            VfsSnapshot::dir([("drop.luau", VfsSnapshot::file("return 'nested'"))]),
+                        ),
+                    ]),
+                )]),
             )
             .unwrap();
 
@@ -286,5 +293,27 @@ mod test {
         assert!(snapshot.removed_files().is_empty());
         snapshot.write_to_vfs("/project", &vfs).unwrap();
         assert!(!vfs.exists("/project/Gone").unwrap());
+    }
+
+    #[test]
+    fn directory_removal_accepts_parent_relative_mounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(directory.path()).unwrap();
+        let project = root.join("project");
+        let shared = root.join("shared");
+        fs_err::create_dir(&project).unwrap();
+        fs_err::create_dir_all(shared.join("Gone")).unwrap();
+        fs_err::write(shared.join("Gone/Drop.luau"), "return 1").unwrap();
+        let path = project.join("../shared/Gone");
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let mut snapshot = FsSnapshot::new();
+
+        assert!(snapshot
+            .remove_path_with_filter(&vfs, &path, &|_| true)
+            .unwrap());
+        snapshot.write_to_vfs(&project, &vfs).unwrap();
+
+        assert!(!shared.join("Gone").exists());
     }
 }

@@ -14,9 +14,10 @@ use rbx_dom_weak::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::Path,
+    path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -170,7 +171,8 @@ pub fn syncback_loop(
         }
     }
     let path_can_be_removed = |path: &Path| {
-        is_valid_path(&ignore_patterns, project_path, path)
+        let path = normalize_syncback_path(path);
+        is_valid_path(&ignore_patterns, project_path, path.as_ref())
             && !ignored_tree_paths
                 .iter()
                 .any(|ignored| path.starts_with(ignored))
@@ -500,9 +502,11 @@ impl SyncbackRules {
 }
 
 fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Path) -> bool {
-    let test_path = match path.strip_prefix(base_path) {
+    let path = normalize_syncback_path(path);
+    let base_path = normalize_syncback_path(base_path);
+    let test_path = match path.strip_prefix(base_path.as_ref()) {
         Ok(suffix) => suffix,
-        Err(_) => path,
+        Err(_) => path.as_ref(),
     };
     if test_path.components().any(|component| {
         component
@@ -525,6 +529,29 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
         }
     }
     true
+}
+
+fn normalize_syncback_path(path: &Path) -> Cow<'_, Path> {
+    if !path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Cow::Borrowed(path);
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir if normalized.file_name().is_some_and(|name| name != "..") => {
+                normalized.pop();
+            }
+            Component::ParentDir if !normalized.has_root() => normalized.push(".."),
+            Component::ParentDir | Component::CurDir => {}
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    Cow::Owned(normalized)
 }
 
 fn tree_is_ignored(path: &str, ignored: &str) -> bool {
@@ -636,6 +663,29 @@ mod test {
         assert!(tree_is_ignored("Parent/Keep", "Parent/Keep"));
         assert!(tree_is_ignored("Parent/Keep/Child", "Parent/Keep/"));
         assert!(!tree_is_ignored("Parent/KeepOther", "Parent/Keep"));
+    }
+
+    #[test]
+    fn path_ignores_match_parent_relative_mount_spellings() {
+        let globs = Some(
+            rules(&["src/Gone/Keep.luau"], Some(false))
+                .compile_globs()
+                .unwrap(),
+        );
+        assert!(!is_valid_path(
+            &globs,
+            Path::new("/project"),
+            Path::new("/project/src/../src/Gone/Keep.luau"),
+        ));
+        assert!(is_valid_path(
+            &globs,
+            Path::new("/project"),
+            Path::new("/project/src/../src/Gone/Drop.luau"),
+        ));
+        assert_eq!(
+            normalize_syncback_path(Path::new("../shared/../kept")),
+            Path::new("../kept")
+        );
     }
 
     #[test]

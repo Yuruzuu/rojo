@@ -219,10 +219,17 @@ fn ignored_descendants_survive_removal_of_their_parent() {
 
     use crate::rojo_test::io_util::ROJO_PATH;
 
-    for rules in [
-        serde_json::json!({"ignorePaths":["src/Gone/Keep.luau"]}),
-        serde_json::json!({"ignoreTrees":["Gone/Keep"]}),
+    for (mount, rule_name) in [
+        ("src", "ignorePaths"),
+        ("src", "ignoreTrees"),
+        ("src/../src", "ignorePaths"),
+        ("src/../src", "ignoreTrees"),
     ] {
+        let rules = if rule_name == "ignorePaths" {
+            serde_json::json!({"ignorePaths":["src/Gone/Keep.luau"]})
+        } else {
+            serde_json::json!({"ignoreTrees":["Gone/Keep"]})
+        };
         let directory = tempdir().unwrap();
         let project = directory.path().join("default.project.json");
         let source = directory.path().join("src");
@@ -236,7 +243,7 @@ fn ignored_descendants_survive_removal_of_their_parent() {
             &project,
             serde_json::to_vec(&serde_json::json!({
                 "name":"Root",
-                "tree":{"$path":"src"},
+                "tree":{"$path":mount},
                 "syncbackRules":rules,
             }))
             .unwrap(),
