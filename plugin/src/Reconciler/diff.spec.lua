@@ -1,4 +1,5 @@
 return function()
+	-- Services
 	local Packages = script.Parent.Parent.Parent.Packages
 	local Log = require(Packages.Log)
 
@@ -6,6 +7,8 @@ return function()
 	local PatchSet = require(script.Parent.Parent.PatchSet)
 
 	local diff = require(script.Parent.diff)
+	local ApplyPatch = require(script.Parent.applyPatch)
+	local GetProperty = require(script.Parent.getProperty)
 
 	local function isEmpty(table)
 		return next(table) == nil, "Table was not empty"
@@ -135,6 +138,74 @@ return function()
 
 		assert(ok, tostring(patch))
 		assert(PatchSet.isEmpty(patch), "expected empty patch")
+	end)
+
+	it("should carry all target properties when replacing a class and preserve source and children", function()
+		local Source = "return { Greeting = 'unchanged' }"
+		local Container = Instance.new("Folder")
+
+		local Root = Instance.new("ModuleScript")
+		Root.Name = "Main"
+		Root.Source = Source
+		Root.Archivable = false
+		Root.Parent = Container
+
+		local Child = Instance.new("Folder")
+		Child.Name = "Child"
+		Child.Parent = Root
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("ROOT", Root)
+		KnownInstances:insert("CHILD", Child)
+
+		local VirtualInstances = {
+			ROOT = {
+				ClassName = "Script",
+				Name = "Main",
+				Properties = {
+					Source = { String = Source },
+					Archivable = { Bool = false },
+					Disabled = { Bool = true },
+				},
+				Children = { "CHILD" },
+			},
+			CHILD = {
+				ClassName = "Folder",
+				Name = "Child",
+				Properties = {},
+				Children = {},
+			},
+		}
+
+		local Success, Patch = diff(KnownInstances, VirtualInstances, "ROOT")
+		assert(Success, tostring(Patch))
+		expect(#Patch.updated).to.equal(1)
+		expect(Patch.updated[1].changedClassName).to.equal("Script")
+		expect(size(Patch.updated[1].changedProperties)).to.equal(3)
+		expect(Patch.updated[1].changedProperties.Source).to.equal(VirtualInstances.ROOT.Properties.Source)
+		expect(Patch.updated[1].changedProperties.Archivable).to.equal(VirtualInstances.ROOT.Properties.Archivable)
+		expect(Patch.updated[1].changedProperties.Disabled).to.equal(VirtualInstances.ROOT.Properties.Disabled)
+
+		local Unapplied = ApplyPatch(KnownInstances, Patch)
+		assert(PatchSet.isEmpty(Unapplied), "expected class replacement to be applied")
+
+		local Replacement = KnownInstances.fromIds.ROOT
+		local ReadSourceSuccess, ReplacementSource = GetProperty(Replacement, "Source")
+		assert(ReadSourceSuccess, "expected replacement source to be readable")
+		expect(ReplacementSource).to.equal(Source)
+		expect(Replacement.ClassName).to.equal("Script")
+		expect(Replacement.Archivable).to.equal(false)
+		expect(Replacement.Disabled).to.equal(true)
+		expect(Child.Parent).to.equal(Replacement)
+		expect(KnownInstances.fromIds.CHILD).to.equal(Child)
+
+		local RediffSuccess, RemainingPatch = diff(KnownInstances, VirtualInstances, "ROOT")
+		assert(RediffSuccess, tostring(RemainingPatch))
+		assert(PatchSet.isEmpty(RemainingPatch), "expected replacement to match the target")
+
+		KnownInstances:stop()
+		Root:Destroy()
+		Container:Destroy()
 	end)
 
 	it("should ignore unknown properties", function()

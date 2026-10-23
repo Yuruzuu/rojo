@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Plugin script class replacements preserve unchanged source and retain the original when source preservation fails.
 * Unsupported property edits no longer stall the plugin's two-way sync batch queue.
 * The in-memory filesystem preserves existing directory contents during recursive creation and rejects file ancestors.
 * On Windows, live sync continues after directly mapped files are deleted and recreated, including relative paths and file-to-directory replacements. Failed watch registrations remain retryable.

@@ -1,8 +1,31 @@
 return function()
+	-- Services
 	local applyPatch = require(script.Parent.applyPatch)
+	local GetProperty = require(script.Parent.getProperty)
 
 	local InstanceMap = require(script.Parent.Parent.InstanceMap)
 	local PatchSet = require(script.Parent.Parent.PatchSet)
+	local RbxDom = require(script.Parent.Parent.Parent.Packages.RbxDom)
+
+	local function WithSourceScriptability(ClassName, Scriptability, Callback)
+		local FindDescriptor = RbxDom.findCanonicalPropertyDescriptor
+
+		RbxDom.findCanonicalPropertyDescriptor = function(RequestedClassName, PropertyName)
+			local Descriptor = FindDescriptor(RequestedClassName, PropertyName)
+			if RequestedClassName == ClassName and PropertyName == "Source" and Descriptor ~= nil then
+				Descriptor.scriptability = Scriptability
+			end
+
+			return Descriptor
+		end
+
+		local Success, Result = pcall(Callback)
+		RbxDom.findCanonicalPropertyDescriptor = FindDescriptor
+
+		assert(Success, tostring(Result))
+
+		return Result
+	end
 
 	local container = Instance.new("Folder")
 
@@ -216,4 +239,121 @@ return function()
 		assert(newChild ~= nil, "expected child to be present")
 		assert(newChild == child, "expected child to be preserved")
 	end)
+
+	it("should preserve source and children when replacing a script without a source update", function()
+		local Source = "return { Greeting = 'kept' }"
+		local Root = Instance.new("ModuleScript")
+		Root.Name = "Original"
+		Root.Source = Source
+		Root.Parent = container
+
+		local Child = Instance.new("Folder")
+		Child.Parent = Root
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("ROOT", Root)
+		KnownInstances:insert("CHILD", Child)
+
+		local Patch = PatchSet.newEmpty()
+		table.insert(Patch.updated, {
+			id = "ROOT",
+			changedClassName = "Script",
+			changedProperties = {},
+		})
+
+		local Unapplied = applyPatch(KnownInstances, Patch)
+		assert(PatchSet.isEmpty(Unapplied), "expected script replacement to be applied")
+
+		local Replacement = KnownInstances.fromIds.ROOT
+		local ReadSourceSuccess, ReplacementSource = GetProperty(Replacement, "Source")
+		assert(ReadSourceSuccess, "expected replacement source to be readable")
+		expect(ReplacementSource).to.equal(Source)
+		expect(Replacement.ClassName).to.equal("Script")
+		expect(Replacement.Name).to.equal("Original")
+		expect(Replacement.Parent).to.equal(container)
+		expect(Child.Parent).to.equal(Replacement)
+		expect(KnownInstances.fromIds.CHILD).to.equal(Child)
+		expect(KnownInstances.fromInstances[Root]).to.equal(nil)
+		expect(Root.Parent).to.equal(nil)
+		expect(Patch.updated[1].changedProperties.Source).to.equal(nil)
+
+		KnownInstances:stop()
+		Root:Destroy()
+	end)
+
+	it("should honor explicit replacement source", function()
+		local Root = Instance.new("ModuleScript")
+		Root.Source = "return 'old source'"
+		Root.Parent = container
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("ROOT", Root)
+
+		local Patch = PatchSet.newEmpty()
+		table.insert(Patch.updated, {
+			id = "ROOT",
+			changedClassName = "Script",
+			changedProperties = {
+				Source = { String = "print('new source')" },
+			},
+		})
+
+		local Unapplied = WithSourceScriptability("ModuleScript", "None", function()
+			return applyPatch(KnownInstances, Patch)
+		end)
+		assert(PatchSet.isEmpty(Unapplied), "expected explicit replacement source to be applied")
+
+		local Replacement = KnownInstances.fromIds.ROOT
+		local ReadSourceSuccess, ReplacementSource = GetProperty(Replacement, "Source")
+		assert(ReadSourceSuccess, "expected replacement source to be readable")
+		expect(ReplacementSource).to.equal("print('new source')")
+
+		KnownInstances:stop()
+		Root:Destroy()
+	end)
+
+	for _, Failure in
+		{
+			{ ClassName = "ModuleScript", Scriptability = "None", Description = "read" },
+			{ ClassName = "Script", Scriptability = "Read", Description = "written" },
+		}
+	do
+		it(`should retain the original script and children when source cannot be {Failure.Description}`, function()
+			local Source = "return 'keep me'"
+			local Root = Instance.new("ModuleScript")
+			Root.Source = Source
+			Root.Parent = container
+
+			local Child = Instance.new("Folder")
+			Child.Parent = Root
+
+			local KnownInstances = InstanceMap.new()
+			KnownInstances:insert("ROOT", Root)
+			KnownInstances:insert("CHILD", Child)
+
+			local Patch = PatchSet.newEmpty()
+			table.insert(Patch.updated, {
+				id = "ROOT",
+				changedClassName = "Script",
+			})
+
+			local Unapplied = WithSourceScriptability(Failure.ClassName, Failure.Scriptability, function()
+				return applyPatch(KnownInstances, Patch)
+			end)
+
+			expect(#Unapplied.updated).to.equal(1)
+			expect(Unapplied.updated[1]).to.equal(Patch.updated[1])
+			expect(next(Unapplied.added)).to.equal(nil)
+			expect(next(Unapplied.removed)).to.equal(nil)
+			expect(KnownInstances.fromIds.ROOT).to.equal(Root)
+			expect(KnownInstances.fromInstances[Root]).to.equal("ROOT")
+			expect(KnownInstances.fromIds.CHILD).to.equal(Child)
+			expect(Root.Parent).to.equal(container)
+			expect(Root.Source).to.equal(Source)
+			expect(Child.Parent).to.equal(Root)
+			expect(#container:GetChildren()).to.equal(1)
+
+			KnownInstances:stop()
+		end)
+	end
 end

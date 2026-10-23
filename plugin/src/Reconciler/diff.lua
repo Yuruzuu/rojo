@@ -3,6 +3,7 @@
 	patch that can be later applied.
 ]]
 
+-- Services
 local Packages = script.Parent.Parent.Parent.Packages
 local Log = require(Packages.Log)
 
@@ -67,6 +68,11 @@ local function diff(instanceMap, virtualInstances, rootId)
 
 		local changedProperties = {}
 		for propertyName, virtualValue in pairs(virtualInstance.Properties) do
+			if changedClassName ~= nil then
+				changedProperties[propertyName] = virtualValue
+				continue
+			end
+
 			local getProperySuccess, existingValueOrErr = getProperty(instance, propertyName)
 
 			if getProperySuccess then
