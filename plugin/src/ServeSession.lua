@@ -114,6 +114,9 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
+		__IncomingPackets = {},
+		__IncomingPacketTail = 0,
+		__ProcessingIncomingPackets = false,
 	}
 
 	setmetatable(self, ServeSession)
@@ -247,24 +250,7 @@ function ServeSession:start()
 
 				return self.__apiContext:connectWebSocket({
 					["messages"] = function(messagesPacket)
-						if not self:__IsActive() then
-							return
-						end
-
-						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
-
-						for _, message in messagesPacket.messages do
-							if not self:__IsActive() then
-								return
-							end
-
-							self:__applyPatch(message)
-						end
-						if not self:__IsActive() then
-							return
-						end
-
-						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						self:__QueueIncomingPacket(messagesPacket)
 					end,
 				})
 			end)
@@ -274,6 +260,56 @@ function ServeSession:start()
 				self:__stopInternal(err)
 			end
 		end)
+end
+
+function ServeSession:__QueueIncomingPacket(Packet)
+	if not self:__IsActive() then
+		return
+	end
+
+	self.__IncomingPacketTail += 1
+	self.__IncomingPackets[self.__IncomingPacketTail] = Packet
+
+	if self.__ProcessingIncomingPackets then
+		return
+	end
+
+	self.__ProcessingIncomingPackets = true
+
+	-- Fallback requests can yield, so packets must finish in order with their cursor updates.
+	local Success, Error = pcall(function()
+		local Head = 1
+
+		while self:__IsActive() and Head <= self.__IncomingPacketTail do
+			local IncomingPacket = self.__IncomingPackets[Head]
+			self.__IncomingPackets[Head] = nil
+			Head += 1
+
+			Log.debug("Received {} messages from Rojo server", #IncomingPacket.messages)
+
+			for _, Patch in IncomingPacket.messages do
+				if not self:__IsActive() then
+					return
+				end
+
+				self:__applyPatch(Patch)
+			end
+
+			if not self:__IsActive() then
+				return
+			end
+
+			self.__apiContext:setMessageCursor(IncomingPacket.messageCursor)
+		end
+	end)
+
+	table.clear(self.__IncomingPackets)
+	self.__IncomingPacketTail = 0
+	self.__ProcessingIncomingPackets = false
+
+	if not Success and self:__IsActive() then
+		self:__stopInternal(Error)
+	end
 end
 
 function ServeSession:stop()
@@ -715,6 +751,10 @@ function ServeSession:__stopInternal(err)
 	end
 
 	self.__status = Status.Disconnected
+	table.clear(self.__IncomingPackets)
+	self.__IncomingPacketTail = 0
+	self.__ProcessingIncomingPackets = false
+
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()

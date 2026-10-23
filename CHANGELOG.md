@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Incoming plugin packets finish in order, preventing delayed fallback responses from overwriting newer edits or rewinding the cursor.
 * Disconnecting the plugin cancels pending work and prevents late responses from resuming a stopped sync session.
 * Plugin patches can clear existing object references with null-reference values.
 * Plugin script class replacements wait for source initialization before publication and retain the original if initialization fails.

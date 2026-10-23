@@ -34,6 +34,7 @@ return function()
 			StopBatcher = 0,
 			Loading = {},
 			Statuses = {},
+			CursorValues = {},
 		}
 
 		local ServerInfo = { projectName = "test", rootInstanceId = "root" }
@@ -63,6 +64,7 @@ return function()
 				Calls.Cursor += 1
 
 				Calls.LastCursor = Cursor
+				table.insert(Calls.CursorValues, Cursor)
 			end,
 			disconnect = function()
 				Calls.Disconnect += 1
@@ -76,6 +78,9 @@ return function()
 			__connections = {},
 			__precommitCallbacks = {},
 			__postcommitCallbacks = {},
+			__IncomingPackets = {},
+			__IncomingPacketTail = 0,
+			__ProcessingIncomingPackets = false,
 			__statusChangedCallback = function(Status)
 				table.insert(Calls.Statuses, Status)
 			end,
@@ -116,6 +121,93 @@ return function()
 		}, ServeSession)
 
 		return Session, Calls, ServerInfo, ReadResponse
+	end
+
+	local function NewPacketSession()
+		local Session, Calls = NewSession()
+		Session:start()
+
+		Calls.Patch = 0
+		Calls.Applied = {}
+
+		local Original = {
+			Name = "part",
+			Source = "original",
+			GetChildren = function()
+				return {}
+			end,
+		}
+		local Parent = {
+			GetChildren = function()
+				return { Original }
+			end,
+		}
+		Original.Parent = Parent
+
+		local Replacement = {
+			Name = "part",
+			Source = "older",
+			GetChildren = function()
+				return {}
+			end,
+		}
+		Session.__instanceMap.fromIds.part = Original
+		Session.__instanceMap.fromInstances[Original] = "part"
+		Session.__instanceMap.insert = function(Map, Id, Instance)
+			Calls.Insert += 1
+
+			local Previous = Map.fromIds[Id]
+			Map.fromInstances[Previous] = nil
+			Map.fromIds[Id] = Instance
+			Map.fromInstances[Instance] = Id
+		end
+
+		local Request, Resolve = Deferred()
+		Session.__apiContext.serialize = function()
+			Calls.Serialize += 1
+
+			return Request
+		end
+		Session.__DeserializeInstances = function()
+			return {
+				{
+					GetChildren = function()
+						return { { Name = "part", Value = Replacement } }
+					end,
+				},
+			}
+		end
+		Session.__apiContext.refPatch = function()
+			Calls.RefPatch += 1
+
+			return Promise.resolve({ patch = PatchSet.newEmpty() })
+		end
+		Session.__reconciler.applyPatch = function()
+			return PatchSet.newEmpty()
+		end
+
+		local OlderPatch = PatchSet.newEmpty()
+		local FollowingPatch = PatchSet.newEmpty()
+		local NewerPatch = PatchSet.newEmpty()
+		Session.__applyPatch = function(self, Patch)
+			Calls.Patch += 1
+
+			if Patch == OlderPatch then
+				local Replaced = self:__replaceInstances({ "part" })
+				if not Replaced then
+					return
+				end
+			else
+				self.__instanceMap.fromIds.part.Source = if Patch == FollowingPatch then "following" else "newer"
+			end
+
+			table.insert(Calls.Applied, {
+				Source = self.__instanceMap.fromIds.part.Source,
+				Cursor = Calls.LastCursor,
+			})
+		end
+
+		return Session, Calls, Resolve, Original, Replacement, OlderPatch, FollowingPatch, NewerPatch
 	end
 
 	describe("initial sync lifecycle", function()
@@ -342,6 +434,106 @@ return function()
 	end)
 
 	describe("running session lifecycle", function()
+		it("finishes a suspended fallback packet and its cursor before applying the next packet", function()
+			local Session, Calls, Resolve, Original, Replacement, OlderPatch, FollowingPatch, NewerPatch =
+				NewPacketSession()
+
+			local FirstPacket = Promise.new(function(Complete)
+				Calls.Handlers.messages({ messages = { OlderPatch, FollowingPatch }, messageCursor = 10 })
+				Complete()
+			end)
+			Calls.Handlers.messages({ messages = { NewerPatch }, messageCursor = 11 })
+
+			expect(FirstPacket:getStatus()).to.equal(Promise.Status.Started)
+			expect(Calls.Patch).to.equal(1)
+			expect(Calls.Serialize).to.equal(1)
+			expect(Calls.LastCursor).to.equal(1)
+			expect(Session.__instanceMap.fromIds.part).to.equal(Original)
+			expect(Original.Source).to.equal("original")
+			expect(Replacement.Parent).to.equal(nil)
+
+			Resolve({ modelContents = "older-model" })
+			expect(FirstPacket:await()).to.equal(true)
+
+			expect(Calls.Patch).to.equal(3)
+			expect(Calls.Applied[1].Source).to.equal("older")
+			expect(Calls.Applied[2].Source).to.equal("following")
+			expect(Calls.Applied[3].Source).to.equal("newer")
+			expect(Calls.Applied[3].Cursor).to.equal(10)
+			expect(Session.__instanceMap.fromIds.part).to.equal(Replacement)
+			expect(Replacement.Source).to.equal("newer")
+			expect(Original.Parent).to.equal(nil)
+			expect(#Calls.CursorValues).to.equal(3)
+			expect(Calls.CursorValues[2]).to.equal(10)
+			expect(Calls.CursorValues[3]).to.equal(11)
+			expect(Calls.LastCursor).to.equal(11)
+			expect(Session.__ProcessingIncomingPackets).to.equal(false)
+			expect(next(Session.__IncomingPackets)).to.equal(nil)
+		end)
+
+		it("drops queued packets on stop while fallback is pending without advancing the cursor", function()
+			local Session, Calls, Resolve, Original, Replacement, OlderPatch, FollowingPatch, NewerPatch =
+				NewPacketSession()
+
+			local FirstPacket = Promise.new(function(Complete)
+				Calls.Handlers.messages({ messages = { OlderPatch, FollowingPatch }, messageCursor = 10 })
+				Complete()
+			end)
+			Calls.Handlers.messages({ messages = { NewerPatch }, messageCursor = 11 })
+			Session:stop()
+
+			expect(next(Session.__IncomingPackets)).to.equal(nil)
+			expect(Session.__ProcessingIncomingPackets).to.equal(false)
+
+			Resolve({ modelContents = "older-model" })
+			expect(FirstPacket:await()).to.equal(true)
+
+			expect(Session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(Calls.Patch).to.equal(1)
+			expect(#Calls.Applied).to.equal(0)
+			expect(Calls.RefPatch).to.equal(0)
+			expect(Calls.Insert).to.equal(0)
+			expect(#Calls.CursorValues).to.equal(1)
+			expect(Calls.LastCursor).to.equal(1)
+			expect(Original.Source).to.equal("original")
+			expect(Replacement.Parent).to.equal(nil)
+		end)
+
+		it("stops a partially applied session and clears the packet queue after an exception", function()
+			local Session, Calls, Resolve, Original, Replacement, OlderPatch, FollowingPatch, NewerPatch =
+				NewPacketSession()
+			Session.__reconciler.applyPatch = function()
+				error("reference patch failed")
+			end
+
+			local Failure
+			Session:onStatusChanged(function(_, Detail)
+				Failure = Detail
+			end)
+
+			local FirstPacket = Promise.new(function(Complete)
+				Calls.Handlers.messages({ messages = { OlderPatch, FollowingPatch }, messageCursor = 10 })
+				Complete()
+			end)
+			Calls.Handlers.messages({ messages = { NewerPatch }, messageCursor = 11 })
+
+			Resolve({ modelContents = "older-model" })
+			expect(FirstPacket:await()).to.equal(true)
+
+			expect(Session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(string.find(Failure, "reference patch failed", 1, true)).to.be.ok()
+			expect(Calls.Disconnect).to.equal(1)
+			expect(Calls.Patch).to.equal(1)
+			expect(Session.__instanceMap.fromIds.part).to.equal(Replacement)
+			expect(Replacement.Source).to.equal("older")
+			expect(Original.Parent).to.equal(nil)
+			expect(#Calls.CursorValues).to.equal(1)
+			expect(Calls.LastCursor).to.equal(1)
+			expect(next(Session.__IncomingPackets)).to.equal(nil)
+			expect(Session.__IncomingPacketTail).to.equal(0)
+			expect(Session.__ProcessingIncomingPackets).to.equal(false)
+		end)
+
 		it("does not apply another message or advance the cursor after a suspended patch stops", function()
 			local Session, Calls = NewSession()
 			Session:start()
