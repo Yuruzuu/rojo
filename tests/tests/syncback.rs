@@ -160,3 +160,52 @@ fn small_numeric_attribute_edits_are_written() {
         "syncback should converge after the edit"
     );
 }
+
+#[test]
+fn new_children_under_relative_root_are_not_pruned() {
+    use std::process::Command;
+
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use tempfile::tempdir;
+
+    use crate::rojo_test::io_util::ROJO_PATH;
+
+    let directory = tempdir().unwrap();
+    let project = directory.path().join("default.project.json");
+    let source = directory.path().join("src");
+    let input = directory.path().join("input.rbxmx");
+    fs_err::create_dir(&source).unwrap();
+    fs_err::write(&project, r#"{"name":"Root","tree":{"$path":"src"}}"#).unwrap();
+    let dom = WeakDom::new(
+        InstanceBuilder::new("Folder").with_name("Root").with_child(
+            InstanceBuilder::new("ModuleScript")
+                .with_name("Added")
+                .with_property("Source", "return 42"),
+        ),
+    );
+    rbx_xml::to_writer_default(
+        fs_err::File::create(&input).unwrap(),
+        &dom,
+        &[dom.root_ref()],
+    )
+    .unwrap();
+
+    let output = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&project)
+        .arg("--input")
+        .arg(&input)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs_err::read_to_string(source.join("Added.luau")).unwrap(),
+        "return 42"
+    );
+}

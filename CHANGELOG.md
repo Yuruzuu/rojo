@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Syncback resolves relative root paths from the project folder so newly added root children are not discarded.
 * Syncback no longer drops small numeric edits and handles sequence keypoints with NaN times without panicking while hashing.
 * Syncback preserves model root names and references between model roots and their descendants.
 * LocalizationTables no longer report as changed when nothing changes. [(#1333)]

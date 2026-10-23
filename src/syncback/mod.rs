@@ -61,8 +61,8 @@ pub fn syncback_loop(
 
     // TODO: Add a better way to tell if the root of a project is a directory
     let skip_pruning = if let Some(path) = &project.tree.path {
-        let middleware =
-            Middleware::middleware_for_path(vfs, &project.sync_rules, path.path()).unwrap();
+        let path = project.folder_location().join(path.path());
+        let middleware = Middleware::middleware_for_path(vfs, &project.sync_rules, &path)?;
         if let Some(middleware) = middleware {
             middleware.is_dir()
         } else {
