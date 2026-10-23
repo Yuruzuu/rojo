@@ -201,6 +201,62 @@ return function()
 		expect(value.Value).to.equal("WORLD")
 	end)
 
+	it("should clear an existing object reference when updated to a null ref", function()
+		local Target = Instance.new("Folder")
+		Target.Parent = container
+
+		local Value = Instance.new("ObjectValue")
+		Value.Value = Target
+		Value.Parent = container
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("VALUE", Value)
+		KnownInstances:insert("TARGET", Target)
+
+		local Patch = PatchSet.newEmpty()
+		table.insert(Patch.updated, {
+			id = "VALUE",
+			changedProperties = {
+				Value = { Ref = "00000000000000000000000000000000" },
+			},
+		})
+
+		local Unapplied = applyPatch(KnownInstances, Patch)
+		assert(PatchSet.isEmpty(Unapplied), "expected null ref to be applied")
+		expect(Value.Value).to.equal(nil)
+		expect(KnownInstances.fromIds.TARGET).to.equal(Target)
+
+		KnownInstances:stop()
+	end)
+
+	it("should retain an existing object reference when its updated ref is missing", function()
+		local Target = Instance.new("Folder")
+		Target.Parent = container
+
+		local Value = Instance.new("ObjectValue")
+		Value.Value = Target
+		Value.Parent = container
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("VALUE", Value)
+
+		local Patch = PatchSet.newEmpty()
+		table.insert(Patch.updated, {
+			id = "VALUE",
+			changedProperties = {
+				Value = { Ref = "MISSING" },
+			},
+		})
+
+		local Unapplied = applyPatch(KnownInstances, Patch)
+		expect(Value.Value).to.equal(Target)
+		expect(#Unapplied.updated).to.equal(1)
+		expect(Unapplied.updated[1].id).to.equal("VALUE")
+		expect(Unapplied.updated[1].changedProperties.Value).to.equal(Patch.updated[1].changedProperties.Value)
+
+		KnownInstances:stop()
+	end)
+
 	it("should recreate instances when changedClassName is set, preserving children", function()
 		local root = Instance.new("Folder")
 		root.Name = "Initial Root Name"

@@ -1,4 +1,5 @@
 return function()
+	-- Services
 	local reify = require(script.Parent.reify)
 	local reifyInstance, applyDeferredRefs = reify.reifyInstance, reify.applyDeferredRefs
 
@@ -349,6 +350,36 @@ return function()
 		expect(root.Value).to.equal(child)
 	end)
 
+	it("should clear an existing reference when applying a deferred null ref", function()
+		local VirtualInstances = {
+			ROOT = {
+				ClassName = "ObjectValue",
+				Name = "Root",
+				Properties = {
+					Value = { Ref = "00000000000000000000000000000000" },
+				},
+				Children = {},
+			},
+		}
+
+		local DeferredRefs = {}
+		local KnownInstances = InstanceMap.new()
+		local Unapplied = reifyInstance(DeferredRefs, KnownInstances, VirtualInstances, "ROOT")
+
+		local Target = Instance.new("Folder")
+		local Root = KnownInstances.fromIds.ROOT
+		Root.Value = Target
+
+		applyDeferredRefs(KnownInstances, DeferredRefs, Unapplied)
+
+		expect(Root.Value).to.equal(nil)
+		assert(PatchSet.isEmpty(Unapplied), "expected null ref to leave no unapplied update")
+
+		KnownInstances:stop()
+		Root:Destroy()
+		Target:Destroy()
+	end)
+
 	it("should return a partial patch when applying invalid refs", function()
 		local virtualInstances = {
 			ROOT = {
@@ -356,8 +387,7 @@ return function()
 				Name = "Root",
 				Properties = {
 					Value = {
-						Type = "Ref",
-						Value = "SORRY",
+						Ref = "SORRY",
 					},
 				},
 				Children = {},

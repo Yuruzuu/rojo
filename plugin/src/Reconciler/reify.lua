@@ -2,6 +2,7 @@
 	"Reifies" a virtual DOM, constructing a real DOM with the same shape.
 ]]
 
+-- Services
 local invariant = require(script.Parent.Parent.invariant)
 local PatchSet = require(script.Parent.Parent.PatchSet)
 local setProperty = require(script.Parent.setProperty)
@@ -127,20 +128,13 @@ function applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
 	end
 
 	for _, entry in deferredRefs do
-		local _, refId = next(entry.virtualValue)
-
-		if refId == nil then
-			continue
-		end
-
-		local targetInstance = instanceMap.fromIds[refId]
-
-		if targetInstance == nil then
+		local DecodeSuccess, TargetInstance = decodeValue(entry.virtualValue, instanceMap)
+		if not DecodeSuccess then
 			markFailed(entry.id, entry.propertyName, entry.virtualValue)
 			continue
 		end
 
-		local setPropertySuccess = setProperty(entry.instance, entry.propertyName, targetInstance)
+		local setPropertySuccess = setProperty(entry.instance, entry.propertyName, TargetInstance)
 		if not setPropertySuccess then
 			markFailed(entry.id, entry.propertyName, entry.virtualValue)
 		end
