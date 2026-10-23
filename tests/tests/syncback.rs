@@ -244,12 +244,17 @@ fn ignored_descendants_survive_removal_of_their_parent() {
 
     use crate::rojo_test::io_util::ROJO_PATH;
 
-    for (mount, rule_name) in [
+    let mut cases = vec![
         ("src", "ignorePaths"),
         ("src", "ignoreTrees"),
         ("src/../src", "ignorePaths"),
         ("src/../src", "ignoreTrees"),
-    ] {
+    ];
+    if cfg!(windows) {
+        cases.extend([("SRC", "ignorePaths"), ("SRC", "ignoreTrees")]);
+    }
+
+    for (mount, rule_name) in cases {
         let rules = if rule_name == "ignorePaths" {
             serde_json::json!({"ignorePaths":["src/Gone/Keep.luau"]})
         } else {

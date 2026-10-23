@@ -171,7 +171,13 @@ pub fn syncback_loop(
         }
     }
     let path_can_be_removed = |path: &Path| {
-        let path = normalize_syncback_path(path);
+        let path = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => vfs
+                .canonicalize(parent)
+                .map(|parent| Cow::Owned(parent.join(name)))
+                .unwrap_or_else(|_| normalize_syncback_path(path)),
+            _ => normalize_syncback_path(path),
+        };
         is_valid_path(&ignore_patterns, project_path, path.as_ref())
             && !ignored_tree_paths
                 .iter()
