@@ -188,12 +188,26 @@ impl VfsBackend for InMemoryFs {
 
     fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let mut path_buf = path.to_path_buf();
-        while let Some(parent) = path_buf.parent() {
-            inner.load_snapshot(parent.to_path_buf(), VfsSnapshot::empty_dir())?;
-            path_buf.pop();
+        let mut missing = Vec::new();
+        let mut current = path;
+        while !current.as_os_str().is_empty() {
+            match inner.entries.get(current) {
+                Some(Entry::Dir { .. }) => break,
+                Some(Entry::File { .. }) => return must_be_dir(current),
+                None => missing.push(current.to_path_buf()),
+            }
+
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent;
         }
-        inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
+
+        for path in missing.into_iter().rev() {
+            inner.load_snapshot(path, VfsSnapshot::empty_dir())?;
+        }
+
+        Ok(())
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {

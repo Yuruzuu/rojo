@@ -594,6 +594,48 @@ mod test {
     use std::io;
     use std::path::PathBuf;
 
+    #[test]
+    fn create_dir_all_preserves_existing_directory_contents() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot(
+                "/project",
+                VfsSnapshot::dir([("keep.luau", VfsSnapshot::file("return 'keep'"))]),
+            )
+            .unwrap();
+        let vfs = Vfs::new(backend);
+
+        vfs.create_dir_all("/project/new/deep").unwrap();
+        vfs.create_dir_all("/project").unwrap();
+
+        let names: Vec<_> = vfs
+            .read_dir("/project")
+            .unwrap()
+            .map(|entry| entry.unwrap().path().file_name().unwrap().to_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "keep.luau"));
+        assert!(names.iter().any(|name| name == "new"));
+        assert_eq!(
+            vfs.read_to_string("/project/keep.luau").unwrap().as_str(),
+            "return 'keep'"
+        );
+    }
+
+    #[test]
+    fn create_dir_all_does_not_replace_a_file() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("/project/file", VfsSnapshot::file("preserved"))
+            .unwrap();
+        let vfs = Vfs::new(backend);
+
+        assert!(vfs.create_dir_all("/project/file/nested").is_err());
+        assert_eq!(
+            vfs.read_to_string("/project/file").unwrap().as_str(),
+            "preserved"
+        );
+    }
+
     #[cfg(windows)]
     fn receive_and_commit_event(
         vfs: &Vfs,
