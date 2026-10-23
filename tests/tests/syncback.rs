@@ -90,3 +90,73 @@ syncback_tests! {
     // than leaving an incorrect value.
     project_default_properties_remove => ["default.project.json"],
 }
+
+#[test]
+fn small_numeric_attribute_edits_are_written() {
+    use std::process::Command;
+
+    use rbx_dom_weak::{types::Attributes, InstanceBuilder, WeakDom};
+    use tempfile::tempdir;
+
+    use crate::rojo_test::io_util::ROJO_PATH;
+
+    let directory = tempdir().unwrap();
+    let project = directory.path().join("default.project.json");
+    let source = directory.path().join("src");
+    let settings = source.join("Settings");
+    let metadata = settings.join("init.meta.json");
+    let input = directory.path().join("input.rbxmx");
+    fs_err::create_dir_all(&settings).unwrap();
+    fs_err::write(&project, r#"{"name":"NumericEdit","tree":{"$path":"src"}}"#).unwrap();
+    fs_err::write(&metadata, r#"{"attributes":{"Speed":0.11}}"#).unwrap();
+
+    let mut attributes = Attributes::new();
+    attributes.insert("Speed".into(), 0.14_f64.into());
+    let dom = WeakDom::new(
+        InstanceBuilder::new("Folder")
+            .with_name("NumericEdit")
+            .with_child(
+                InstanceBuilder::new("Folder")
+                    .with_name("Settings")
+                    .with_property("Attributes", attributes),
+            ),
+    );
+    rbx_xml::to_writer_default(
+        fs_err::File::create(&input).unwrap(),
+        &dom,
+        &[dom.root_ref()],
+    )
+    .unwrap();
+
+    let run = || {
+        Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&project)
+            .arg("--input")
+            .arg(&input)
+            .args(["--non-interactive", "--list"])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs_err::read(&metadata).unwrap()).unwrap();
+    assert_eq!(result["attributes"]["Speed"], 0.14);
+
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "syncback should converge after the edit"
+    );
+}

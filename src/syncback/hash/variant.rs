@@ -1,12 +1,6 @@
 use blake3::Hasher;
 use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
 
-macro_rules! round {
-    ($value:expr) => {
-        (($value * 10.0).round() / 10.0)
-    };
-}
-
 macro_rules! n_hash {
     ($hash:ident, $($num:expr),*) => {
         {$(
@@ -23,8 +17,7 @@ macro_rules! hash {
 
 /// Places `value` into the provided hasher.
 pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
-    // We need to round floats, though I'm not sure to what degree we can
-    // realistically do that.
+    // Equal hashes skip serialization, so numeric edits must keep their full precision.
     match value {
         Variant::Attributes(attrs) => {
             let mut sorted: Vec<(&String, &Variant)> = attrs.iter().collect();
@@ -44,23 +37,21 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             vector_hash(hasher, cf.orientation.y);
             vector_hash(hasher, cf.orientation.z);
         }
-        Variant::Color3(color) => {
-            n_hash!(hasher, round!(color.r), round!(color.g), round!(color.b))
-        }
+        Variant::Color3(color) => n_hash!(hasher, color.r, color.g, color.b),
         Variant::Color3uint8(color) => hash!(hasher, &[color.r, color.b, color.g]),
         Variant::ColorSequence(seq) => {
             let mut new = Vec::with_capacity(seq.keypoints.len());
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| a.time.total_cmp(&b.time));
             for keypoint in new {
                 n_hash!(
                     hasher,
-                    round!(keypoint.time),
-                    round!(keypoint.color.r),
-                    round!(keypoint.color.g),
-                    round!(keypoint.color.b)
+                    keypoint.time,
+                    keypoint.color.r,
+                    keypoint.color.g,
+                    keypoint.color.b
                 )
             }
         }
@@ -90,8 +81,8 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             n_hash!(hasher, e.value);
         }
         Variant::Faces(f) => hash!(hasher, &[f.bits()]),
-        Variant::Float32(n) => n_hash!(hasher, round!(*n)),
-        Variant::Float64(n) => n_hash!(hasher, round!(n)),
+        Variant::Float32(n) => n_hash!(hasher, n),
+        Variant::Float64(n) => n_hash!(hasher, n),
         Variant::Font(f) => {
             n_hash!(hasher, f.weight as u16);
             n_hash!(hasher, f.style as u8);
@@ -107,20 +98,15 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
         Variant::Int64(n) => n_hash!(hasher, n),
         Variant::MaterialColors(n) => hash!(hasher, n.encode().as_slice()),
         Variant::NetAssetRef(net_asset) => hash!(hasher, net_asset.hash().as_bytes()),
-        Variant::NumberRange(nr) => n_hash!(hasher, round!(nr.max), round!(nr.min)),
+        Variant::NumberRange(nr) => n_hash!(hasher, nr.max, nr.min),
         Variant::NumberSequence(seq) => {
             let mut new = Vec::with_capacity(seq.keypoints.len());
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| a.time.total_cmp(&b.time));
             for keypoint in new {
-                n_hash!(
-                    hasher,
-                    round!(keypoint.time),
-                    round!(keypoint.value),
-                    round!(keypoint.envelope)
-                )
+                n_hash!(hasher, keypoint.time, keypoint.value, keypoint.envelope)
             }
         }
         Variant::OptionalCFrame(maybe_cf) => {
@@ -140,12 +126,12 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
                 hash!(hasher, &[0x00]);
                 n_hash!(
                     hasher,
-                    round!(custom.density()),
-                    round!(custom.friction()),
-                    round!(custom.elasticity()),
-                    round!(custom.friction_weight()),
-                    round!(custom.elasticity_weight()),
-                    round!(custom.acoustic_absorption())
+                    custom.density(),
+                    custom.friction(),
+                    custom.elasticity(),
+                    custom.friction_weight(),
+                    custom.elasticity_weight(),
+                    custom.acoustic_absorption()
                 )
             }
         },
@@ -153,13 +139,7 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             vector_hash(hasher, ray.origin);
             vector_hash(hasher, ray.direction);
         }
-        Variant::Rect(rect) => n_hash!(
-            hasher,
-            round!(rect.max.x),
-            round!(rect.max.y),
-            round!(rect.min.x),
-            round!(rect.min.y)
-        ),
+        Variant::Rect(rect) => n_hash!(hasher, rect.max.x, rect.max.y, rect.min.x, rect.min.y),
         Variant::Ref(referent) => hash!(hasher, referent.to_string().as_bytes()),
         Variant::Region3(region) => {
             vector_hash(hasher, region.max);
@@ -186,15 +166,15 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
                 hash!(hasher, tag.as_bytes())
             }
         }
-        Variant::UDim(udim) => n_hash!(hasher, round!(udim.scale), udim.offset),
+        Variant::UDim(udim) => n_hash!(hasher, udim.scale, udim.offset),
         Variant::UDim2(udim) => n_hash!(
             hasher,
-            round!(udim.y.scale),
+            udim.y.scale,
             udim.y.offset,
-            round!(udim.x.scale),
+            udim.x.scale,
             udim.x.offset
         ),
-        Variant::Vector2(v2) => n_hash!(hasher, round!(v2.x), round!(v2.y)),
+        Variant::Vector2(v2) => n_hash!(hasher, v2.x, v2.y),
         Variant::Vector2int16(v2) => n_hash!(hasher, v2.x, v2.y),
         Variant::Vector3(v3) => vector_hash(hasher, *v3),
         Variant::Vector3int16(v3) => n_hash!(hasher, v3.x, v3.y, v3.z),
@@ -212,5 +192,65 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
 }
 
 fn vector_hash(hasher: &mut Hasher, vector: Vector3) {
-    n_hash!(hasher, round!(vector.x), round!(vector.y), round!(vector.z))
+    n_hash!(hasher, vector.x, vector.y, vector.z)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rbx_dom_weak::types::{Attributes, Color3, NumberSequence, NumberSequenceKeypoint};
+
+    fn digest(value: &Variant) -> blake3::Hash {
+        let mut hasher = Hasher::new();
+        hash_variant(&mut hasher, value);
+        hasher.finalize()
+    }
+
+    #[test]
+    fn close_float_values_have_distinct_hashes() {
+        assert_ne!(
+            digest(&Variant::Float32(0.11)),
+            digest(&Variant::Float32(0.14))
+        );
+        assert_ne!(
+            digest(&Variant::Float64(0.11)),
+            digest(&Variant::Float64(0.14))
+        );
+    }
+
+    #[test]
+    fn small_vector_and_color_edits_have_distinct_hashes() {
+        assert_ne!(
+            digest(&Variant::Vector3(Vector3::new(0.11, 1.0, 2.0))),
+            digest(&Variant::Vector3(Vector3::new(0.14, 1.0, 2.0)))
+        );
+        assert_ne!(
+            digest(&Variant::Color3(Color3::new(0.11, 0.5, 1.0))),
+            digest(&Variant::Color3(Color3::new(0.14, 0.5, 1.0)))
+        );
+    }
+
+    #[test]
+    fn numeric_attribute_edits_have_distinct_hashes() {
+        let attributes = |value| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Speed".into(), Variant::Float64(value));
+            Variant::Attributes(attributes)
+        };
+
+        assert_ne!(digest(&attributes(0.11)), digest(&attributes(0.14)));
+    }
+
+    #[test]
+    fn sequences_with_nan_times_hash_deterministically() {
+        let sequence = Variant::NumberSequence(NumberSequence {
+            keypoints: vec![
+                NumberSequenceKeypoint::new(0.0, 0.0, 0.0),
+                NumberSequenceKeypoint::new(f32::NAN, 0.5, 0.0),
+                NumberSequenceKeypoint::new(1.0, 1.0, 0.0),
+            ],
+        });
+
+        assert_eq!(digest(&sequence), digest(&sequence));
+    }
 }
