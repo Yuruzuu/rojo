@@ -29,6 +29,10 @@ struct WatchRegistrations {
 
 impl WatchRegistrations {
     fn watch(&mut self, watcher: &mut impl Watcher, path: &Path) -> io::Result<()> {
+        // Match notify's absolute event paths without resolving filesystem aliases.
+        let path = std::path::absolute(path)?;
+        let path = path.as_path();
+
         let kind = if fs_err::metadata(path)?.is_file() {
             WatchKind::File
         } else {
@@ -61,6 +65,14 @@ impl WatchRegistrations {
     }
 
     fn unwatch(&mut self, watcher: &mut impl Watcher, path: &Path) -> io::Result<()> {
+        let path = std::path::absolute(path)?;
+        self.unwatch_descendants(watcher, &path);
+
+        self.paths.remove(&path);
+        watcher.unwatch(&path).map_err(io::Error::other)
+    }
+
+    fn unwatch_descendants(&mut self, watcher: &mut impl Watcher, path: &Path) {
         // Descendants may have been registered before this directory was watched.
         let descendants: Vec<_> = self
             .paths
@@ -73,20 +85,21 @@ impl WatchRegistrations {
             self.paths.remove(&descendant);
             let _ = watcher.unwatch(&descendant);
         }
-
-        self.paths.remove(path);
-        watcher.unwatch(path).map_err(io::Error::other)
     }
 
     #[cfg(windows)]
     fn unwatch_removed(&mut self, watcher: &mut impl Watcher, path: &Path) -> io::Result<()> {
+        let path = std::path::absolute(path)?;
+        self.unwatch_descendants(watcher, &path);
+
         // Windows file watches filter events from the parent directory. Keeping
         // that registration lets it observe the file being recreated.
-        if self.paths.get(path) == Some(&WatchKind::File) {
+        if self.paths.get(&path) == Some(&WatchKind::File) {
             return Ok(());
         }
 
-        self.unwatch(watcher, path)
+        self.paths.remove(&path);
+        watcher.unwatch(&path).map_err(io::Error::other)
     }
 }
 
@@ -288,6 +301,46 @@ mod test {
     }
 
     #[test]
+    fn relative_watch_registration_uses_absolute_paths() {
+        let root = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let path = dir.path().join("file.txt");
+        let relative_path = path.strip_prefix(&root).unwrap();
+        fs_err::write(&path, "contents").unwrap();
+
+        let mut registrations = WatchRegistrations::default();
+        let mut watcher = RecordingWatcher::default();
+        registrations.watch(&mut watcher, relative_path).unwrap();
+        registrations.watch(&mut watcher, &path).unwrap();
+
+        assert_eq!(watcher.watches, vec![path.clone()]);
+        assert_eq!(registrations.paths.get(&path), Some(&WatchKind::File));
+        assert!(!registrations.paths.contains_key(relative_path));
+    }
+
+    #[test]
+    fn unwatch_missing_relative_directory_cleans_descendants() {
+        let root = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let path = dir.path().join("watched");
+        let relative_path = path.strip_prefix(&root).unwrap();
+        fs_err::create_dir(&path).unwrap();
+        let child = path.join("child.txt");
+        fs_err::write(&child, "contents").unwrap();
+
+        let mut registrations = WatchRegistrations::default();
+        let mut watcher = RecordingWatcher::default();
+        registrations.watch(&mut watcher, &child).unwrap();
+        registrations.watch(&mut watcher, relative_path).unwrap();
+
+        fs_err::remove_dir_all(&path).unwrap();
+        registrations.unwatch(&mut watcher, relative_path).unwrap();
+
+        assert!(registrations.paths.is_empty());
+        assert_eq!(watcher.unwatches, vec![child, path]);
+    }
+
+    #[test]
     fn directory_watch_covers_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
@@ -414,6 +467,65 @@ mod test {
         registrations.unwatch(&mut watcher, &path).unwrap();
         assert!(registrations.paths.is_empty());
         assert_eq!(watcher.unwatches, vec![path]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn relative_file_registration_survives_absolute_removal() {
+        let root = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let path = dir.path().join("file.txt");
+        let relative_path = path.strip_prefix(&root).unwrap();
+        fs_err::write(&path, "contents").unwrap();
+
+        let mut registrations = WatchRegistrations::default();
+        let mut watcher = RecordingWatcher::default();
+        registrations.watch(&mut watcher, relative_path).unwrap();
+
+        fs_err::remove_file(&path).unwrap();
+        registrations.unwatch_removed(&mut watcher, &path).unwrap();
+
+        assert_eq!(registrations.paths.get(&path), Some(&WatchKind::File));
+        assert!(watcher.unwatches.is_empty());
+
+        registrations.unwatch(&mut watcher, relative_path).unwrap();
+        assert!(registrations.paths.is_empty());
+        assert_eq!(watcher.unwatches, vec![path]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removed_file_registration_cleans_descendants_after_becoming_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced");
+        fs_err::write(&path, "contents").unwrap();
+
+        let mut registrations = WatchRegistrations::default();
+        let mut watcher = RecordingWatcher::default();
+        registrations.watch(&mut watcher, &path).unwrap();
+
+        fs_err::remove_file(&path).unwrap();
+        registrations.unwatch_removed(&mut watcher, &path).unwrap();
+        fs_err::create_dir(&path).unwrap();
+        let child = path.join("child.txt");
+        fs_err::write(&child, "contents").unwrap();
+        registrations.watch(&mut watcher, &child).unwrap();
+
+        fs_err::remove_dir_all(&path).unwrap();
+        watcher.fail_unwatch = true;
+        registrations.unwatch_removed(&mut watcher, &path).unwrap();
+
+        assert_eq!(registrations.paths.len(), 1);
+        assert_eq!(registrations.paths.get(&path), Some(&WatchKind::File));
+        assert_eq!(watcher.unwatches, vec![child.clone()]);
+
+        fs_err::create_dir(&path).unwrap();
+        fs_err::write(&child, "recreated").unwrap();
+        watcher.fail_unwatch = false;
+        registrations.watch(&mut watcher, &child).unwrap();
+
+        assert_eq!(watcher.watches, vec![path, child.clone(), child.clone()]);
+        assert_eq!(registrations.paths.get(&child), Some(&WatchKind::File));
     }
 
     #[test]

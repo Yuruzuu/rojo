@@ -31,7 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
-* On Windows, live sync continues after a directly mapped file is deleted and recreated, and failed watch registrations remain retryable.
+* On Windows, live sync continues after directly mapped files are deleted and recreated, including relative paths and file-to-directory replacements. Failed watch registrations remain retryable.
 * Live sync subscriptions cannot miss a change published while the subscription is being registered.
 * Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Syncback preserves ignored descendants when removing a parent directory, including parent-relative mounts, and protects nested Git directories.

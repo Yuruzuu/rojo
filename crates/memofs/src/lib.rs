@@ -664,6 +664,51 @@ mod test {
 
     #[test]
     #[cfg(windows)]
+    fn std_backend_relative_file_watch_survives_delete_recreate() {
+        use crate::VfsEvent;
+
+        let root = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&root).unwrap();
+        let path = dir.path().join("mapped.luau");
+        let relative_path = path.strip_prefix(&root).unwrap();
+        fs_err::write(&path, "return 0").unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        let receiver = vfs.event_receiver();
+        vfs.read(relative_path).unwrap();
+
+        fs_err::remove_file(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "absolute removal of relative file",
+            |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &path),
+        );
+
+        fs_err::write(&path, "recreated").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "relative file recreation",
+            |event| matches!(event, VfsEvent::Create(event_path) if event_path == &path),
+        );
+
+        fs_err::write(&path, "return 1").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "subsequent relative file write",
+            |event| matches!(event, VfsEvent::Write(event_path) if event_path == &path),
+        );
+
+        assert_eq!(
+            vfs.read_to_string(relative_path).unwrap().as_str(),
+            "return 1"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn std_backend_file_watch_can_become_recursive_directory() {
         use crate::VfsEvent;
 
@@ -711,6 +756,91 @@ mod test {
             "nested file write",
             |event| matches!(event, VfsEvent::Write(event_path) if event_path == &child),
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn std_backend_replaced_file_cleans_descendant_watch_on_directory_removal() {
+        use crate::VfsEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped");
+        let sibling = dir.path().join("sibling.luau");
+        fs_err::write(&path, "contents").unwrap();
+        fs_err::write(&sibling, "return 0").unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        let receiver = vfs.event_receiver();
+        vfs.read(&path).unwrap();
+
+        fs_err::remove_file(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "file removal",
+            |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &path),
+        );
+
+        fs_err::create_dir(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "directory replacing file",
+            |event| matches!(event, VfsEvent::Create(event_path) if event_path == &path),
+        );
+
+        // Leave the ancestor's file registration in place while the child gets
+        // its own watch, as it would for a separately mapped file.
+        let child = path.join("child.luau");
+        fs_err::write(&child, "return 0").unwrap();
+        vfs.read(&child).unwrap();
+        fs_err::write(&child, "return 1").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "initial child write",
+            |event| matches!(event, VfsEvent::Write(event_path) if event_path == &child),
+        );
+
+        fs_err::remove_file(&child).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "child removal before directory removal",
+            |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &child),
+        );
+
+        fs_err::remove_dir_all(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "replacement directory removal",
+            |event| matches!(event, VfsEvent::Remove(event_path) if event_path == &path),
+        );
+
+        // A new watch is acknowledged after notify processes queued unwatches,
+        // so the old child watch is closed before the directory is recreated.
+        vfs.read(&sibling).unwrap();
+
+        fs_err::create_dir(&path).unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "replacement directory recreation",
+            |event| matches!(event, VfsEvent::Create(event_path) if event_path == &path),
+        );
+
+        fs_err::write(&child, "recreated").unwrap();
+        vfs.read(&child).unwrap();
+        fs_err::write(&child, "return 2").unwrap();
+        receive_and_commit_event(
+            &vfs,
+            &receiver,
+            "re-registered child write",
+            |event| matches!(event, VfsEvent::Write(event_path) if event_path == &child),
+        );
+
+        assert_eq!(vfs.read_to_string(&child).unwrap().as_str(), "return 2");
     }
 
     /// https://github.com/rojo-rbx/rojo/issues/899
