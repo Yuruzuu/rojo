@@ -21,21 +21,37 @@ local function addAllToPatch(patchSet, virtualInstances, id)
 	end
 end
 
-function reifyInstance(deferredRefs, instanceMap, virtualInstances, rootId, parentInstance)
+function reifyInstance(deferredRefs, instanceMap, virtualInstances, rootId, parentInstance, BeforePublication)
 	-- Create an empty patch that will be populated with any parts of this reify
 	-- that could not happen, like instances that couldn't be created and
 	-- properties that could not be assigned.
 	local unappliedPatch = PatchSet.newEmpty()
 
-	reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, rootId, parentInstance)
+	local CreatedInstance = reifyInstanceInner(
+		unappliedPatch,
+		deferredRefs,
+		instanceMap,
+		virtualInstances,
+		rootId,
+		parentInstance,
+		BeforePublication
+	)
 
-	return unappliedPatch
+	return unappliedPatch, CreatedInstance
 end
 
 --[[
 	Inner function that defines the core routine.
 ]]
-function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, id, parentInstance)
+function reifyInstanceInner(
+	unappliedPatch,
+	deferredRefs,
+	instanceMap,
+	virtualInstances,
+	id,
+	parentInstance,
+	BeforePublication
+)
 	local virtualInstance = virtualInstances[id]
 
 	if virtualInstance == nil then
@@ -55,6 +71,15 @@ function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualIn
 	-- TODO: Can this fail? Previous versions of Rojo guarded against this, but
 	-- the reason why was uncertain.
 	instance.Name = virtualInstance.Name
+
+	if BeforePublication ~= nil then
+		local InitializeSuccess, Ready = pcall(BeforePublication, instance)
+		if not InitializeSuccess or not Ready then
+			instance:Destroy()
+			addAllToPatch(unappliedPatch, virtualInstances, id)
+			return
+		end
+	end
 
 	-- Track all of the properties that we've failed to assign to this instance.
 	local unappliedProperties = {}
@@ -99,6 +124,8 @@ function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualIn
 
 	instance.Parent = parentInstance
 	instanceMap:insert(id, instance)
+
+	return instance
 end
 
 function applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)

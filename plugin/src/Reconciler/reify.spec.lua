@@ -55,6 +55,77 @@ return function()
 		assert(isEmpty(unappliedPatch.updated), "expected no updates")
 	end)
 
+	for _, Outcome in { false, "error" } do
+		it(`should leave the existing mapping untouched when initialization fails with {Outcome}`, function()
+			local Container = Instance.new("Folder")
+			local Original = Instance.new("Folder")
+			Original.Parent = Container
+
+			local KnownInstances = InstanceMap.new()
+			KnownInstances:insert("ROOT", Original)
+
+			local VirtualInstances = {
+				ROOT = {
+					ClassName = "Folder",
+					Name = "Replacement",
+					Properties = {},
+					Children = { "CHILD" },
+				},
+				CHILD = {
+					ClassName = "Folder",
+					Name = "Child",
+					Properties = {},
+					Children = {},
+				},
+			}
+
+			local Candidate
+			local ObservedParent
+			local ObservedMapping
+			local DeferredRefs = {}
+			local Unapplied, CreatedInstance = reifyInstance(
+				DeferredRefs,
+				KnownInstances,
+				VirtualInstances,
+				"ROOT",
+				Container,
+				function(Replacement)
+					Candidate = Replacement
+					ObservedParent = Replacement.Parent
+					ObservedMapping = KnownInstances.fromIds.ROOT
+
+					if Outcome == "error" then
+						error("Initializer failed")
+					end
+
+					return Outcome
+				end
+			)
+
+			assert(Candidate ~= nil, "expected initializer to receive the candidate")
+			expect(ObservedParent).to.equal(nil)
+			expect(ObservedMapping).to.equal(Original)
+			expect(CreatedInstance).to.equal(nil)
+			expect(KnownInstances.fromIds.ROOT).to.equal(Original)
+			expect(KnownInstances.fromIds.CHILD).to.equal(nil)
+			expect(KnownInstances:size()).to.equal(1)
+			expect(Original.Parent).to.equal(Container)
+			expect(#Container:GetChildren()).to.equal(1)
+			expect(Unapplied.added.ROOT).to.equal(VirtualInstances.ROOT)
+			expect(Unapplied.added.CHILD).to.equal(VirtualInstances.CHILD)
+			expect(next(Unapplied.updated)).to.equal(nil)
+			expect(next(DeferredRefs)).to.equal(nil)
+
+			local Reparented = pcall(function()
+				Candidate.Parent = Container
+			end)
+			expect(Reparented).to.equal(false)
+
+			KnownInstances:stop()
+			Container:Destroy()
+		end)
+	end
+
 	it("should assign name and properties", function()
 		local virtualInstances = {
 			ROOT = {

@@ -2,6 +2,7 @@ return function()
 	-- Services
 	local applyPatch = require(script.Parent.applyPatch)
 	local GetProperty = require(script.Parent.getProperty)
+	local ScriptSourceInitializer = require(script.Parent.ScriptSourceInitializer)
 
 	local InstanceMap = require(script.Parent.Parent.InstanceMap)
 	local PatchSet = require(script.Parent.Parent.PatchSet)
@@ -52,6 +53,77 @@ return function()
 		container:Destroy()
 		tempContainer:Destroy()
 	end)
+
+	local function NewScriptReplacement()
+		local Source = "return 'original source'"
+		local Root = Instance.new("ModuleScript")
+		Root.Name = "Original"
+		Root.Source = Source
+		Root.Parent = container
+
+		local Child = Instance.new("Folder")
+		Child.Parent = Root
+
+		local KnownInstances = InstanceMap.new()
+		KnownInstances:insert("ROOT", Root)
+		KnownInstances:insert("CHILD", Child)
+
+		local Patch = PatchSet.newEmpty()
+		table.insert(Patch.updated, {
+			id = "ROOT",
+			changedClassName = "Script",
+			changedProperties = {
+				Source = { String = "print('replacement source')" },
+			},
+		})
+
+		return {
+			Source = Source,
+			Root = Root,
+			Child = Child,
+			KnownInstances = KnownInstances,
+			Patch = Patch,
+		}
+	end
+
+	local function WithPendingSourceInitialization(Fixture, Callback)
+		local Initialize = ScriptSourceInitializer.Initialize
+		ScriptSourceInitializer.Initialize = function(Replacement, Source)
+			local Outcome = coroutine.yield(Replacement, Source)
+			if Outcome == "error" then
+				error("Source initialization failed after yielding")
+			end
+
+			return Outcome and Initialize(Replacement, Source)
+		end
+
+		local PatchThread = coroutine.create(applyPatch)
+		local Success, Result = pcall(function()
+			local Started, Replacement, Source = coroutine.resume(PatchThread, Fixture.KnownInstances, Fixture.Patch)
+			assert(Started, tostring(Replacement))
+			expect(coroutine.status(PatchThread)).to.equal("suspended")
+			expect(Source).to.equal(Fixture.Patch.updated[1].changedProperties.Source.String)
+			expect(Replacement.Parent).to.equal(nil)
+			expect(#Replacement:GetChildren()).to.equal(0)
+			expect(Fixture.Root.Parent).to.equal(container)
+			expect(Fixture.Root.Source).to.equal(Fixture.Source)
+			expect(Fixture.Child.Parent).to.equal(Fixture.Root)
+			expect(Fixture.KnownInstances.fromIds.ROOT).to.equal(Fixture.Root)
+			expect(Fixture.KnownInstances.fromInstances[Fixture.Root]).to.equal("ROOT")
+			expect(Fixture.KnownInstances.fromIds.CHILD).to.equal(Fixture.Child)
+			expect(Fixture.KnownInstances.fromInstances[Replacement]).to.equal(nil)
+			expect(#container:GetChildren()).to.equal(1)
+
+			Callback(PatchThread, Replacement)
+		end)
+		ScriptSourceInitializer.Initialize = Initialize
+
+		if coroutine.status(PatchThread) ~= "dead" then
+			coroutine.close(PatchThread)
+		end
+
+		assert(Success, tostring(Result))
+	end
 
 	it("should return an empty patch if given an empty patch", function()
 		local patch = applyPatch(InstanceMap.new(), PatchSet.newEmpty())
@@ -367,6 +439,95 @@ return function()
 		KnownInstances:stop()
 		Root:Destroy()
 	end)
+
+	it("should publish a replacement only after delayed source initialization succeeds", function()
+		local Fixture = NewScriptReplacement()
+
+		WithPendingSourceInitialization(Fixture, function(PatchThread, Replacement)
+			local Completed, Unapplied = coroutine.resume(PatchThread, true)
+			assert(Completed, tostring(Unapplied))
+			expect(coroutine.status(PatchThread)).to.equal("dead")
+			assert(PatchSet.isEmpty(Unapplied), "expected initialized replacement to be applied")
+			expect(Fixture.KnownInstances.fromIds.ROOT).to.equal(Replacement)
+			expect(Fixture.KnownInstances.fromInstances[Fixture.Root]).to.equal(nil)
+			expect(Replacement.Parent).to.equal(container)
+			expect(Replacement.Source).to.equal("print('replacement source')")
+			expect(Fixture.Child.Parent).to.equal(Replacement)
+			expect(Fixture.KnownInstances.fromIds.CHILD).to.equal(Fixture.Child)
+			expect(Fixture.Root.Parent).to.equal(nil)
+		end)
+
+		Fixture.KnownInstances:stop()
+		Fixture.Root:Destroy()
+	end)
+
+	for _, Outcome in { false, "error" } do
+		it(`should retain the original script after delayed source initialization fails with {Outcome}`, function()
+			local Fixture = NewScriptReplacement()
+
+			WithPendingSourceInitialization(Fixture, function(PatchThread, Replacement)
+				local Completed, Unapplied = coroutine.resume(PatchThread, Outcome)
+				assert(Completed, tostring(Unapplied))
+				expect(coroutine.status(PatchThread)).to.equal("dead")
+				expect(#Unapplied.updated).to.equal(1)
+				expect(Unapplied.updated[1]).to.equal(Fixture.Patch.updated[1])
+				expect(next(Unapplied.added)).to.equal(nil)
+				expect(next(Unapplied.removed)).to.equal(nil)
+				expect(Fixture.KnownInstances.fromIds.ROOT).to.equal(Fixture.Root)
+				expect(Fixture.KnownInstances.fromInstances[Fixture.Root]).to.equal("ROOT")
+				expect(Fixture.Root.Parent).to.equal(container)
+				expect(Fixture.Root.Source).to.equal(Fixture.Source)
+				expect(Fixture.Child.Parent).to.equal(Fixture.Root)
+				expect(Fixture.KnownInstances.fromIds.CHILD).to.equal(Fixture.Child)
+
+				local Reparented = pcall(function()
+					Replacement.Parent = container
+				end)
+				expect(Reparented).to.equal(false)
+				expect(#container:GetChildren()).to.equal(1)
+			end)
+
+			Fixture.KnownInstances:stop()
+		end)
+	end
+
+	for _, Invalidation in { "stop", "remove", "supersede" } do
+		it(`should not publish delayed source initialization after map {Invalidation}`, function()
+			local Fixture = NewScriptReplacement()
+
+			WithPendingSourceInitialization(Fixture, function(PatchThread, Replacement)
+				local ExpectedInstance
+				if Invalidation == "stop" then
+					Fixture.KnownInstances:stop()
+				elseif Invalidation == "remove" then
+					Fixture.KnownInstances:removeId("ROOT")
+				else
+					ExpectedInstance = Instance.new("Folder")
+					ExpectedInstance.Parent = container
+					Fixture.KnownInstances:insert("ROOT", ExpectedInstance)
+				end
+
+				local Completed, Unapplied = coroutine.resume(PatchThread, true)
+				assert(Completed, tostring(Unapplied))
+				expect(coroutine.status(PatchThread)).to.equal("dead")
+				expect(#Unapplied.updated).to.equal(1)
+				expect(Unapplied.updated[1]).to.equal(Fixture.Patch.updated[1])
+				expect(next(Unapplied.added)).to.equal(nil)
+				expect(Fixture.KnownInstances.fromIds.ROOT).to.equal(ExpectedInstance)
+				expect(Fixture.KnownInstances.fromInstances[Fixture.Root]).to.equal(nil)
+				expect(Fixture.Root.Parent).to.equal(container)
+				expect(Fixture.Root.Source).to.equal(Fixture.Source)
+				expect(Fixture.Child.Parent).to.equal(Fixture.Root)
+
+				local Reparented = pcall(function()
+					Replacement.Parent = container
+				end)
+				expect(Reparented).to.equal(false)
+			end)
+
+			Fixture.KnownInstances:stop()
+		end)
+	end
 
 	for _, Failure in
 		{

@@ -18,6 +18,7 @@ local GetProperty = require(script.Parent.getProperty)
 local reify = require(script.Parent.reify)
 local reifyInstance, applyDeferredRefs = reify.reifyInstance, reify.applyDeferredRefs
 local setProperty = require(script.Parent.setProperty)
+local ScriptSourceInitializer = require(script.Parent.ScriptSourceInitializer)
 
 local function applyPatch(instanceMap, patch)
 	-- Tracks any portions of the patch that could not be applied to the DOM.
@@ -131,16 +132,34 @@ local function applyPatch(instanceMap, patch)
 					or update.changedClassName == "ModuleScript"
 				)
 
-			-- Incremental patches can omit Source even when replacing one script with another.
-			if ReplacesScript and newProperties.Source == nil then
-				local ReadSourceSuccess, HasSource, Source = pcall(GetProperty, instance, "Source")
-				if not ReadSourceSuccess or not HasSource then
+			local BeforePublication
+			if ReplacesScript then
+				local Source
+				local HasSource
+
+				-- Incremental patches can omit Source even when replacing one script with another.
+				if newProperties.Source == nil then
+					local ReadSourceSuccess
+					ReadSourceSuccess, HasSource, Source = pcall(GetProperty, instance, "Source")
+					HasSource = ReadSourceSuccess and HasSource
+				else
+					HasSource, Source = decodeValue(newProperties.Source, instanceMap)
+				end
+
+				if not HasSource or typeof(Source) ~= "string" or instanceMap.fromIds[update.id] ~= instance then
 					table.insert(unappliedPatch.updated, update)
 					continue
 				end
 
 				newProperties = table.clone(newProperties)
-				newProperties.Source = { String = Source }
+				newProperties.Source = nil
+
+				BeforePublication = function(Replacement)
+					local Initialized = ScriptSourceInitializer.Initialize(Replacement, Source)
+
+					-- Initialization can yield while the session stops or this ID is replaced.
+					return Initialized and instanceMap.fromIds[update.id] == instance
+				end
 			end
 
 			-- If the instance's ClassName changed, we'll kick into reify to
@@ -159,26 +178,20 @@ local function applyPatch(instanceMap, patch)
 			}
 
 			local ReplacementDeferredRefs = {}
-			local failedToReify =
-				reifyInstance(ReplacementDeferredRefs, instanceMap, mockAdded, update.id, instance.Parent)
-
-			local newInstance = instanceMap.fromIds[update.id]
-
-			local SourceFailed = false
-			if ReplacesScript then
-				for _, FailedUpdate in failedToReify.updated do
-					if FailedUpdate.changedProperties.Source ~= nil then
-						SourceFailed = true
-						break
-					end
-				end
-			end
+			local failedToReify, newInstance = reifyInstance(
+				ReplacementDeferredRefs,
+				instanceMap,
+				mockAdded,
+				update.id,
+				instance.Parent,
+				BeforePublication
+			)
 
 			-- Some parts of reify may have failed, but this is not necessarily
 			-- critical. If the instance wasn't recreated, has the wrong Name, or
 			-- couldn't retain its Source, we'll consider our attempt a failure.
-			if instance == newInstance or newInstance.Name ~= newName or SourceFailed then
-				if newInstance ~= instance then
+			if newInstance == nil or newInstance.Name ~= newName then
+				if newInstance ~= nil then
 					instanceMap:insert(update.id, instance)
 					newInstance:Destroy()
 				end
