@@ -8,6 +8,7 @@ Use the following format:
 ```
 ## Unreleased
 
+* Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Made a change to Rojo ([#0000])
 
 [#0000]:  https://github.com/rojo-rbx/rojo/pull/0000

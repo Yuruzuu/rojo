@@ -42,7 +42,10 @@ impl<'a> SubscribeMessage<'a> {
 
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
+            let Some(instance) = tree.get_instance(id) else {
+                // A later queued patch may already have removed this instance.
+                continue;
+            };
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
@@ -311,4 +314,100 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchAdd, PatchSet};
+
+    #[test]
+    fn queued_addition_removed_before_serialization() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+        let root_id = tree.get_root_id();
+        let addition = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                added_instances: vec![
+                    PatchAdd {
+                        parent_id: root_id,
+                        instance: InstanceSnapshot::new()
+                            .name("Transient")
+                            .class_name("Folder"),
+                    },
+                    PatchAdd {
+                        parent_id: root_id,
+                        instance: InstanceSnapshot::new()
+                            .name("Surviving")
+                            .class_name("Folder")
+                            .children(vec![InstanceSnapshot::new()
+                                .name("Child")
+                                .class_name("Part")]),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let removed_id = addition.added[0];
+        let surviving_ids = addition.added[1..].to_vec();
+        let removal = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                removed_instances: vec![removed_id],
+                ..Default::default()
+            },
+        );
+
+        let messages = [
+            SubscribeMessage::from_patch_update(&tree, addition),
+            SubscribeMessage::from_patch_update(&tree, removal),
+        ];
+        assert_eq!(messages[0].added.len(), surviving_ids.len());
+        for id in surviving_ids {
+            assert!(messages[0].added.contains_key(&id));
+        }
+        let serialized = serde_json::to_value(&messages).unwrap();
+        assert_eq!(serialized[1]["removed"], serde_json::json!([removed_id]));
+    }
+
+    #[test]
+    fn queued_addition_ancestor_removed_before_serialization() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+        let ancestor_id = tree.insert_instance(
+            tree.get_root_id(),
+            InstanceSnapshot::new()
+                .name("Ancestor")
+                .class_name("Folder"),
+        );
+        let addition = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                added_instances: vec![PatchAdd {
+                    parent_id: ancestor_id,
+                    instance: InstanceSnapshot::new()
+                        .name("Transient")
+                        .class_name("Folder")
+                        .children(vec![InstanceSnapshot::new()
+                            .name("Child")
+                            .class_name("Part")]),
+                }],
+                ..Default::default()
+            },
+        );
+        let removal = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                removed_instances: vec![ancestor_id],
+                ..Default::default()
+            },
+        );
+
+        let messages = [
+            SubscribeMessage::from_patch_update(&tree, addition),
+            SubscribeMessage::from_patch_update(&tree, removal),
+        ];
+        assert!(messages[0].added.is_empty());
+        let serialized = serde_json::to_value(&messages).unwrap();
+        assert_eq!(serialized[1]["removed"], serde_json::json!([ancestor_id]));
+    }
 }
