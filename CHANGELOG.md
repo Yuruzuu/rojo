@@ -8,9 +8,6 @@ Use the following format:
 ```
 ## Unreleased
 
-* On Windows, live sync continues after a directly mapped file is deleted and recreated, and failed watch registrations remain retryable.
-* Live sync subscriptions cannot miss a change published while the subscription is being registered.
-* Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Made a change to Rojo ([#0000])
 
 [#0000]:  https://github.com/rojo-rbx/rojo/pull/0000
@@ -34,6 +31,9 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* On Windows, live sync continues after a directly mapped file is deleted and recreated, and failed watch registrations remain retryable.
+* Live sync subscriptions cannot miss a change published while the subscription is being registered.
+* Live sync no longer crashes when queued additions have already been removed before a client receives them.
 * Syncback preserves ignored descendants when removing a parent directory and protects nested Git directories.
 * Syncback rejects unsafe new directory names and preserves children whose names would otherwise overwrite reserved init files.
 * Syncback updates existing init script files in place and preserves edits to their directory metadata.
