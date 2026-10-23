@@ -21,7 +21,7 @@ use std::{
 };
 
 use crate::{
-    glob::{Glob, IgnorableGlob},
+    glob::IgnorableGlob,
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::Middleware,
     syncback::ref_properties::{collect_referents, link_referents},
@@ -43,9 +43,6 @@ pub use snapshot::{SyncbackData, SyncbackSnapshot};
 /// This will **not** override existing `Rbxm` middleware. It will only impact
 /// new files.
 const DEBUG_MODEL_FORMAT_VAR: &str = "ROJO_SYNCBACK_DEBUG";
-
-/// A glob that can be used to tell if a path contains a `.git` folder.
-static GIT_IGNORE_GLOB: OnceLock<Glob> = OnceLock::new();
 
 pub fn syncback_loop(
     vfs: &Vfs,
@@ -147,6 +144,37 @@ pub fn syncback_loop(
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
     let project_path = project.folder_location();
+    let mut ignored_tree_paths = Vec::new();
+    if let Some(rules) = project
+        .syncback_rules
+        .as_ref()
+        .filter(|rules| !rules.ignore_trees.is_empty())
+    {
+        for inst in old_tree.inner().descendants() {
+            let inst_path = old_tree.inner().full_path_of(inst.referent(), "/");
+            if rules
+                .ignore_trees
+                .iter()
+                .any(|ignored| tree_is_ignored(&inst_path, ignored))
+            {
+                ignored_tree_paths.extend(
+                    old_tree
+                        .get_instance(inst.referent())
+                        .unwrap()
+                        .metadata()
+                        .relevant_paths
+                        .iter()
+                        .cloned(),
+                );
+            }
+        }
+    }
+    let path_can_be_removed = |path: &Path| {
+        is_valid_path(&ignore_patterns, project_path, path)
+            && !ignored_tree_paths
+                .iter()
+                .any(|ignored| path.starts_with(ignored))
+    };
 
     let syncback_data = SyncbackData {
         vfs,
@@ -190,7 +218,7 @@ pub fn syncback_loop(
         if let Some(syncback_rules) = &project.syncback_rules {
             // Ignore trees;
             for ignored in &syncback_rules.ignore_trees {
-                if inst_path.starts_with(ignored.as_str()) {
+                if tree_is_ignored(&inst_path, ignored) {
                     log::debug!("Tree {inst_path} is blocked by project");
                     continue 'syncback;
                 }
@@ -239,7 +267,18 @@ pub fn syncback_loop(
                 if new_syncback_result.is_ok() && snapshot.old_inst().is_some() {
                     // We need to remove the old FS representation if we're
                     // reserializing it as an rbxm.
-                    fs_snapshot.remove_dir(&snapshot.path);
+                    let mut removals = FsSnapshot::new();
+                    if !removals.remove_path_with_filter(
+                        vfs,
+                        &snapshot.path,
+                        &path_can_be_removed,
+                    )? {
+                        anyhow::bail!(
+                            "Cannot replace {} with a model file because it contains ignored paths",
+                            snapshot.path.display()
+                        );
+                    }
+                    fs_snapshot.merge(removals);
                 }
                 new_syncback_result?
             }
@@ -263,17 +302,13 @@ pub fn syncback_loop(
                 }
                 if let Some(syncback_rules) = &project.syncback_rules {
                     for ignored in &syncback_rules.ignore_trees {
-                        if inst_path.starts_with(ignored.as_str()) {
+                        if tree_is_ignored(&inst_path, ignored) {
                             log::debug!("Skipping removing {inst_path} because its path is blocked by project");
                             continue 'remove;
                         }
                     }
                 }
-                if path.is_dir() {
-                    fs_snapshot.remove_dir(path)
-                } else {
-                    fs_snapshot.remove_file(path)
-                }
+                fs_snapshot.remove_path_with_filter(vfs, path, &path_can_be_removed)?;
             }
         }
 
@@ -465,12 +500,16 @@ impl SyncbackRules {
 }
 
 fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Path) -> bool {
-    let git_glob = GIT_IGNORE_GLOB.get_or_init(|| Glob::new(".git/**").unwrap());
     let test_path = match path.strip_prefix(base_path) {
         Ok(suffix) => suffix,
         Err(_) => path,
     };
-    if git_glob.is_match(test_path) {
+    if test_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+    }) {
         return false;
     }
     if let Some(ref ignore_paths) = globs {
@@ -486,6 +525,15 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
         }
     }
     true
+}
+
+fn tree_is_ignored(path: &str, ignored: &str) -> bool {
+    let ignored = ignored.trim_end_matches('/');
+    ignored.is_empty()
+        || path == ignored
+        || path
+            .strip_prefix(ignored)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Returns a set of properties that should not be written with syncback if
@@ -582,6 +630,69 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn tree_ignores_match_whole_path_components() {
+        assert!(tree_is_ignored("Parent/Keep", "Parent/Keep"));
+        assert!(tree_is_ignored("Parent/Keep/Child", "Parent/Keep/"));
+        assert!(!tree_is_ignored("Parent/KeepOther", "Parent/Keep"));
+    }
+
+    #[test]
+    fn git_directories_are_ignored_at_any_depth() {
+        let base = Path::new("/project");
+        for path in [
+            ".git",
+            ".git/config",
+            "src/Nested/.git/config",
+            "src/.GIT/objects",
+        ] {
+            assert!(!is_valid_path(&None, base, &base.join(path)), "{path}");
+        }
+        assert!(is_valid_path(&None, base, &base.join("src/.gitkeep")));
+    }
+
+    #[test]
+    fn ignored_files_prevent_destructive_model_fallback() {
+        let (_directory, vfs, project, _) = syncback_fixture(None);
+        let root = project.folder_location();
+        let worker = root.join("src/Worker");
+        vfs.create_dir(&worker).unwrap();
+        vfs.write(worker.join("Keep.luau"), "return 'protected'")
+            .unwrap();
+        vfs.write(
+            &project.file_location,
+            r#"{"name":"Root","tree":{"$path":"src"},"syncbackRules":{"ignorePaths":["src/Worker/Keep.luau"]}}"#,
+        )
+        .unwrap();
+        let project = Project::load_exact(&vfs, &project.file_location, None).unwrap();
+        let mut old_tree = rebuild_project(&vfs, &project);
+        let new_tree = WeakDom::new(
+            InstanceBuilder::new("Folder").with_name("Root").with_child(
+                InstanceBuilder::new("Folder")
+                    .with_name("Worker")
+                    .with_children(["return 1", "return 2"].map(|source| {
+                        InstanceBuilder::new("ModuleScript")
+                            .with_name("Duplicate")
+                            .with_property("Source", source)
+                    })),
+            ),
+        );
+
+        let result = syncback_loop(&vfs, &mut old_tree, new_tree, &project);
+
+        assert!(
+            result.is_err(),
+            "fallback must preserve ignored source files"
+        );
+        assert_eq!(
+            vfs.read_to_string(worker.join("Keep.luau"))
+                .unwrap()
+                .as_str(),
+            "return 'protected'"
+        );
+        assert!(!vfs.exists(root.join("src/Worker.rbxm")).unwrap());
+    }
 
     fn syncback_fixture(
         existing_init: Option<&str>,

@@ -209,3 +209,66 @@ fn new_children_under_relative_root_are_not_pruned() {
         "return 42"
     );
 }
+
+#[test]
+fn ignored_descendants_survive_removal_of_their_parent() {
+    use std::process::Command;
+
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use tempfile::tempdir;
+
+    use crate::rojo_test::io_util::ROJO_PATH;
+
+    for rules in [
+        serde_json::json!({"ignorePaths":["src/Gone/Keep.luau"]}),
+        serde_json::json!({"ignoreTrees":["Gone/Keep"]}),
+    ] {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        let source = directory.path().join("src");
+        let removed = source.join("Gone");
+        let input = directory.path().join("input.rbxmx");
+        fs_err::create_dir_all(removed.join("Nested")).unwrap();
+        fs_err::write(removed.join("Keep.luau"), "return 'protected'").unwrap();
+        fs_err::write(removed.join("Drop.luau"), "return 'removed'").unwrap();
+        fs_err::write(removed.join("Nested/Drop.luau"), "return 'nested'").unwrap();
+        fs_err::write(
+            &project,
+            serde_json::to_vec(&serde_json::json!({
+                "name":"Root",
+                "tree":{"$path":"src"},
+                "syncbackRules":rules,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dom = WeakDom::new(InstanceBuilder::new("Folder").with_name("Root"));
+        rbx_xml::to_writer_default(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            &[dom.root_ref()],
+        )
+        .unwrap();
+
+        let output = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&project)
+            .arg("--input")
+            .arg(&input)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs_err::read_to_string(removed.join("Keep.luau")).unwrap(),
+            "return 'protected'"
+        );
+        assert!(!removed.join("Drop.luau").exists());
+        assert!(!removed.join("Nested").exists());
+    }
+}

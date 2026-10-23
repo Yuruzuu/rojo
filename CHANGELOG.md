@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Syncback preserves ignored descendants when removing a parent directory and protects nested Git directories.
 * Syncback rejects unsafe new directory names and preserves children whose names would otherwise overwrite reserved init files.
 * Syncback updates existing init script files in place and preserves edits to their directory metadata.
 * Syncback resolves relative root paths from the project folder so newly added root children are not discarded.

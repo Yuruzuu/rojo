@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
 
 /// A simple representation of a subsection of a file system.
 #[derive(Default)]
@@ -87,6 +87,45 @@ impl FsSnapshot {
     /// Removes the provided path, as a directory.
     pub fn remove_dir<P: AsRef<Path>>(&mut self, path: P) {
         self.removed_dirs.insert(path.as_ref().to_path_buf());
+    }
+
+    pub(super) fn remove_path_with_filter(
+        &mut self,
+        vfs: &Vfs,
+        path: &Path,
+        predicate: &impl Fn(&Path) -> bool,
+    ) -> io::Result<bool> {
+        if !predicate(path) {
+            return Ok(false);
+        }
+
+        let Some(metadata) = vfs.metadata(path).with_not_found()? else {
+            return Ok(true);
+        };
+        if metadata.is_file() {
+            self.remove_file(path);
+            return Ok(true);
+        }
+
+        // Selective removal must not follow directory links into another tree.
+        if vfs.canonicalize(path)? != path {
+            return Ok(false);
+        }
+
+        let mut children = Self::new();
+        let mut remove_entire_directory = true;
+        for entry in vfs.read_dir(path)? {
+            remove_entire_directory &=
+                children.remove_path_with_filter(vfs, entry?.path(), predicate)?;
+        }
+
+        if remove_entire_directory {
+            self.remove_dir(path);
+        } else {
+            self.merge(children);
+        }
+
+        Ok(remove_entire_directory)
     }
 
     /// Writes the `FsSnapshot` to the provided VFS, using the provided `base`
@@ -187,5 +226,65 @@ impl FsSnapshot {
         let mut removed_dirs: Vec<_> = self.removed_dirs.iter().map(PathBuf::as_path).collect();
         removed_dirs.sort_unstable();
         removed_dirs
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use memofs::{InMemoryFs, VfsSnapshot};
+
+    fn removal_fixture() -> Vfs {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot(
+                "/project/Gone",
+                VfsSnapshot::dir([
+                    ("keep.luau", VfsSnapshot::file("return 'keep'")),
+                    ("drop.luau", VfsSnapshot::file("return 'drop'")),
+                    (
+                        "Nested",
+                        VfsSnapshot::dir([("drop.luau", VfsSnapshot::file("return 'nested'"))]),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        Vfs::new(backend)
+    }
+
+    #[test]
+    fn directory_removal_preserves_ignored_descendants() {
+        let vfs = removal_fixture();
+        let mut snapshot = FsSnapshot::new();
+        snapshot
+            .remove_path_with_filter(&vfs, Path::new("/project/Gone"), &|path| {
+                path.file_name().unwrap() != "keep.luau"
+            })
+            .unwrap();
+        snapshot.write_to_vfs("/project", &vfs).unwrap();
+
+        assert_eq!(
+            vfs.read_to_string("/project/Gone/keep.luau")
+                .unwrap()
+                .as_str(),
+            "return 'keep'"
+        );
+        assert!(!vfs.exists("/project/Gone/drop.luau").unwrap());
+        assert!(!vfs.exists("/project/Gone/Nested").unwrap());
+    }
+
+    #[test]
+    fn unfiltered_directory_removal_removes_the_whole_tree() {
+        let vfs = removal_fixture();
+        let mut snapshot = FsSnapshot::new();
+        snapshot
+            .remove_path_with_filter(&vfs, Path::new("/project/Gone"), &|_| true)
+            .unwrap();
+
+        assert_eq!(snapshot.removed_dirs(), vec![Path::new("/project/Gone")]);
+        assert!(snapshot.removed_files().is_empty());
+        snapshot.write_to_vfs("/project", &vfs).unwrap();
+        assert!(!vfs.exists("/project/Gone").unwrap());
     }
 }
