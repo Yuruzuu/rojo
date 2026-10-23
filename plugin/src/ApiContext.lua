@@ -1,5 +1,7 @@
-local Packages = script.Parent.Parent.Packages
+-- Services
 local HttpService = game:GetService("HttpService")
+
+local Packages = script.Parent.Parent.Packages
 local Http = require(Packages.Http)
 local Log = require(Packages.Log)
 local Promise = require(Packages.Promise)
@@ -123,29 +125,62 @@ end
 
 function ApiContext:disconnect()
 	self.__connected = false
-	for request in self.__activeRequests do
-		Log.trace("Cancelling request {}", request)
-		request:cancel()
-	end
+
+	local ActiveRequests = self.__activeRequests
 	self.__activeRequests = {}
+	for Request in ActiveRequests do
+		Log.trace("Cancelling request {}", Request)
+		Request:cancel()
+	end
 
 	if self.__wsClient then
 		Log.trace("Closing WebSocket client")
-		self.__wsClient:Close()
+		local WebSocketClient = self.__wsClient
+		self.__wsClient = nil
+		WebSocketClient:Close()
 	end
-	self.__wsClient = nil
+end
+
+function ApiContext:__TrackRequest(Request)
+	self.__activeRequests[Request] = true
+	if not self.__connected then
+		Request:cancel()
+	end
+
+	return Request:finally(function()
+		self.__activeRequests[Request] = nil
+	end)
+end
+
+function ApiContext:__Request(Method, Url, Body)
+	if not self.__connected then
+		return Promise.reject("API context disconnected")
+	end
+
+	return self:__TrackRequest(
+		Http[Method](Url, Body):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(Response)
+			-- HTTP runs in a detached coroutine, so cancellation cannot stop the request itself.
+			if not self.__connected then
+				return Promise.reject("API context disconnected")
+			end
+
+			return Response
+		end)
+	)
 end
 
 function ApiContext:setMessageCursor(index)
+	if not self.__connected then
+		return
+	end
+
 	self.__messageCursor = index
 end
 
 function ApiContext:connect()
 	local url = ("%s/api/rojo"):format(self.__baseUrl)
 
-	return Http.get(url)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
+	return self:__Request("get", url)
 		:andThen(rejectWrongProtocolVersion)
 		:andThen(function(body)
 			assert(validateApiInfo(body))
@@ -154,6 +189,10 @@ function ApiContext:connect()
 		end)
 		:andThen(rejectWrongPlaceId)
 		:andThen(function(body)
+			if not self.__connected then
+				return Promise.reject("API context disconnected")
+			end
+
 			self.__sessionId = body.sessionId
 
 			return body
@@ -163,7 +202,7 @@ end
 function ApiContext:read(ids)
 	local url = ("%s/api/read/%s"):format(self.__baseUrl, table.concat(ids, ","))
 
-	return Http.get(url):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
+	return self:__Request("get", url):andThen(function(body)
 		if body.sessionId ~= self.__sessionId then
 			return Promise.reject("Server changed ID")
 		end
@@ -208,82 +247,155 @@ function ApiContext:write(patch)
 
 	body = Http.msgpackEncode(body)
 
-	return Http.post(url, body)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
-		:andThen(function(responseBody)
-			Log.info("Write response: {:?}", responseBody)
+	return self:__Request("post", url, body):andThen(function(responseBody)
+		Log.info("Write response: {:?}", responseBody)
 
-			return responseBody
-		end)
+		return responseBody
+	end)
 end
 
 function ApiContext:connectWebSocket(packetHandlers)
+	if not self.__connected then
+		return Promise.reject("API context disconnected")
+	end
+
 	local url = ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
-	return Promise.new(function(resolve, reject)
-		local success, wsClient =
-			pcall(HttpService.CreateWebStreamClient, HttpService, Enum.WebStreamClientType.WebSocket, {
-				Url = url,
-			})
-		if not success then
-			reject("Failed to create WebSocket client: " .. tostring(wsClient))
-			return
-		end
-		self.__wsClient = wsClient
+	return self:__TrackRequest(Promise.new(function(resolve, reject, OnCancel)
+		local Cancelled = false
+		local WebSocketClient
+		local Connections = {}
+		local Cleaned = false
 
-		local closed, errored, received
-
-		received = self.__wsClient.MessageReceived:Connect(function(msg)
-			local data = Http.msgpackDecode(msg)
-			if data.sessionId ~= self.__sessionId then
-				Log.warn("Received message with wrong session ID; ignoring")
+		local function Cleanup(CloseClient)
+			if Cleaned or not WebSocketClient then
 				return
 			end
 
-			assert(validateApiSocketPacket(data))
-
-			Log.trace("Received websocket packet: {:#?}", data)
-
-			local handler = packetHandlers[data.packetType]
-			if handler then
-				local ok, err = pcall(handler, data.body)
-				if not ok then
-					Log.error("Error in WebSocket packet handler for type '%s': %s", data.packetType, err)
-				end
-			else
-				Log.warn("No handler for WebSocket packet type '%s'", data.packetType)
+			Cleaned = true
+			for _, Connection in Connections do
+				Connection:Disconnect()
 			end
-		end)
 
-		closed = self.__wsClient.Closed:Connect(function()
-			closed:Disconnect()
-			errored:Disconnect()
-			received:Disconnect()
-
-			if self.__connected then
-				reject("WebSocket connection closed unexpectedly")
-			else
-				resolve()
+			if self.__wsClient == WebSocketClient then
+				self.__wsClient = nil
 			end
+
+			if CloseClient then
+				WebSocketClient:Close()
+			end
+		end
+
+		OnCancel(function()
+			Cancelled = true
+			Cleanup(true)
 		end)
 
-		errored = self.__wsClient.Error:Connect(function(code, msg)
-			closed:Disconnect()
-			errored:Disconnect()
-			received:Disconnect()
+		local function CreateAndConnect()
+			local success, wsClient = pcall(self.__CreateWebSocketClient, self, url)
+			if success then
+				WebSocketClient = wsClient
+			end
 
-			reject("WebSocket error: " .. code .. " - " .. msg)
-		end)
-	end)
+			if Cancelled or not self.__connected then
+				Cleanup(true)
+				reject("API context disconnected")
+				return
+			end
+
+			if not success then
+				reject("Failed to create WebSocket client: " .. tostring(wsClient))
+				return
+			end
+			self.__wsClient = wsClient
+
+			table.insert(
+				Connections,
+				wsClient.MessageReceived:Connect(function(msg)
+					if not self.__connected or self.__wsClient ~= wsClient then
+						return
+					end
+
+					local data = Http.msgpackDecode(msg)
+					if not self.__connected or self.__wsClient ~= wsClient then
+						return
+					end
+
+					if data.sessionId ~= self.__sessionId then
+						Log.warn("Received message with wrong session ID; ignoring")
+						return
+					end
+
+					assert(validateApiSocketPacket(data))
+
+					Log.trace("Received websocket packet: {:#?}", data)
+
+					local handler = packetHandlers[data.packetType]
+					if handler then
+						local ok, err = pcall(handler, data.body)
+						if not ok then
+							Log.error("Error in WebSocket packet handler for type '%s': %s", data.packetType, err)
+						end
+					else
+						Log.warn("No handler for WebSocket packet type '%s'", data.packetType)
+					end
+				end)
+			)
+
+			table.insert(
+				Connections,
+				wsClient.Closed:Connect(function()
+					if Cleaned then
+						return
+					end
+
+					Cleanup(false)
+
+					if self.__connected then
+						reject("WebSocket connection closed unexpectedly")
+					else
+						resolve()
+					end
+				end)
+			)
+
+			table.insert(
+				Connections,
+				wsClient.Error:Connect(function(code, msg)
+					if Cleaned then
+						return
+					end
+
+					Cleanup(true)
+
+					reject("WebSocket error: " .. code .. " - " .. msg)
+				end)
+			)
+		end
+
+		-- Cancellation closes the Promise executor; creation must outlive it to close a late client.
+		coroutine.wrap(function()
+			local Success, Error = pcall(CreateAndConnect)
+			if not Success then
+				Cleanup(true)
+				reject(Error)
+			end
+		end)()
+	end))
+end
+
+function ApiContext:__CreateWebSocketClient(Url)
+	return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
+		Url = Url,
+	})
 end
 
 function ApiContext:open(id)
 	local url = ("%s/api/open/%s"):format(self.__baseUrl, id)
 
-	return Http.post(url, ""):andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(body)
+	return self:__Request("post", url, ""):andThen(function(body)
 		if body.sessionId ~= self.__sessionId then
 			return Promise.reject("Server changed ID")
 		end
@@ -296,36 +408,30 @@ function ApiContext:serialize(ids: { string })
 	local url = ("%s/api/serialize"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
-		:andThen(function(response_body)
-			if response_body.sessionId ~= self.__sessionId then
-				return Promise.reject("Server changed ID")
-			end
+	return self:__Request("post", url, request_body):andThen(function(response_body)
+		if response_body.sessionId ~= self.__sessionId then
+			return Promise.reject("Server changed ID")
+		end
 
-			assert(validateApiSerialize(response_body))
+		assert(validateApiSerialize(response_body))
 
-			return response_body
-		end)
+		return response_body
+	end)
 end
 
 function ApiContext:refPatch(ids: { string })
 	local url = ("%s/api/ref-patch"):format(self.__baseUrl)
 	local request_body = Http.msgpackEncode({ sessionId = self.__sessionId, ids = ids })
 
-	return Http.post(url, request_body)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
-		:andThen(function(response_body)
-			if response_body.sessionId ~= self.__sessionId then
-				return Promise.reject("Server changed ID")
-			end
+	return self:__Request("post", url, request_body):andThen(function(response_body)
+		if response_body.sessionId ~= self.__sessionId then
+			return Promise.reject("Server changed ID")
+		end
 
-			assert(validateApiRefPatch(response_body))
+		assert(validateApiRefPatch(response_body))
 
-			return response_body
-		end)
+		return response_body
+	end)
 end
 
 return ApiContext

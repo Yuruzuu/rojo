@@ -31,6 +31,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Disconnecting the plugin cancels pending work and prevents late responses from resuming a stopped sync session.
 * Plugin patches can clear existing object references with null-reference values.
 * Plugin script class replacements preserve unchanged source and retain the original when source preservation fails.
 * Unsupported property edits no longer stall the plugin's two-way sync batch queue.
