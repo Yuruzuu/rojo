@@ -1,5 +1,5 @@
 use blake3::Hasher;
-use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
+use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, VariantType, Vector3};
 
 macro_rules! n_hash {
     ($hash:ident, $($num:expr),*) => {
@@ -25,7 +25,14 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             sorted.sort_unstable_by_key(|(name, _)| *name);
             for (name, attribute) in sorted {
                 hasher.update(name.as_bytes());
-                hash_variant(hasher, attribute);
+                match attribute {
+                    // UTF-8 binary attributes serialize as ordinary strings in metadata.
+                    Variant::BinaryString(bytes) if std::str::from_utf8(bytes.as_ref()).is_ok() => {
+                        n_hash!(hasher, VariantType::String as u32);
+                        hasher.update(bytes.as_ref());
+                    }
+                    _ => hash_variant(hasher, attribute),
+                }
             }
         }
         Variant::Axes(a) => hash!(hasher, &[a.bits()]),
@@ -226,6 +233,26 @@ mod test {
         assert_ne!(
             digest(&Variant::Float64(0.25)),
             digest(&Variant::Vector2(Vector2::new(0.0, 1.625))),
+        );
+    }
+
+    #[test]
+    fn utf8_binary_attributes_hash_like_their_metadata_representation() {
+        let attributes = |value| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Rojo_Id".into(), value);
+            Variant::Attributes(attributes)
+        };
+
+        assert_eq!(
+            digest(&attributes(Variant::String("stable".into()))),
+            digest(&attributes(Variant::BinaryString(
+                b"stable".to_vec().into()
+            ))),
+        );
+        assert_ne!(
+            digest(&Variant::String("stable".into())),
+            digest(&Variant::BinaryString(b"stable".to_vec().into())),
         );
     }
 
