@@ -18,6 +18,7 @@ macro_rules! hash {
 /// Places `value` into the provided hasher.
 pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
     // Equal hashes skip serialization, so numeric edits must keep their full precision.
+    n_hash!(hasher, value.ty() as u32);
     match value {
         Variant::Attributes(attrs) => {
             let mut sorted: Vec<(&String, &Variant)> = attrs.iter().collect();
@@ -198,7 +199,9 @@ fn vector_hash(hasher: &mut Hasher, vector: Vector3) {
 #[cfg(test)]
 mod test {
     use super::*;
-    use rbx_dom_weak::types::{Attributes, Color3, NumberSequence, NumberSequenceKeypoint};
+    use rbx_dom_weak::types::{
+        Attributes, Color3, NumberSequence, NumberSequenceKeypoint, Vector2,
+    };
 
     fn digest(value: &Variant) -> blake3::Hash {
         let mut hasher = Hasher::new();
@@ -215,6 +218,14 @@ mod test {
         assert_ne!(
             digest(&Variant::Float64(0.11)),
             digest(&Variant::Float64(0.14))
+        );
+    }
+
+    #[test]
+    fn different_variant_types_cannot_alias_the_same_payload() {
+        assert_ne!(
+            digest(&Variant::Float64(0.25)),
+            digest(&Variant::Vector2(Vector2::new(0.0, 1.625))),
         );
     }
 

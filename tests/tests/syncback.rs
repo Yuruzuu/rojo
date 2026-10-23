@@ -95,70 +95,95 @@ syncback_tests! {
 fn small_numeric_attribute_edits_are_written() {
     use std::process::Command;
 
-    use rbx_dom_weak::{types::Attributes, InstanceBuilder, WeakDom};
+    use rbx_dom_weak::{
+        types::{Attributes, Variant, Vector2},
+        InstanceBuilder, WeakDom,
+    };
     use tempfile::tempdir;
 
     use crate::rojo_test::io_util::ROJO_PATH;
 
-    let directory = tempdir().unwrap();
-    let project = directory.path().join("default.project.json");
-    let source = directory.path().join("src");
-    let settings = source.join("Settings");
-    let metadata = settings.join("init.meta.json");
-    let input = directory.path().join("input.rbxmx");
-    fs_err::create_dir_all(&settings).unwrap();
-    fs_err::write(&project, r#"{"name":"NumericEdit","tree":{"$path":"src"}}"#).unwrap();
-    fs_err::write(&metadata, r#"{"attributes":{"Speed":0.11}}"#).unwrap();
+    for (previous, next) in [
+        (0.11, Variant::Float64(0.14)),
+        (0.25, Variant::Vector2(Vector2::new(0.0, 1.625))),
+    ] {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        let source = directory.path().join("src");
+        let settings = source.join("Settings");
+        let metadata = settings.join("init.meta.json");
+        let input = directory.path().join("input.rbxmx");
+        fs_err::create_dir_all(&settings).unwrap();
+        fs_err::write(&project, r#"{"name":"NumericEdit","tree":{"$path":"src"}}"#).unwrap();
+        fs_err::write(
+            &metadata,
+            serde_json::to_vec(&serde_json::json!({"attributes":{"Speed":previous}})).unwrap(),
+        )
+        .unwrap();
 
-    let mut attributes = Attributes::new();
-    attributes.insert("Speed".into(), 0.14_f64.into());
-    let dom = WeakDom::new(
-        InstanceBuilder::new("Folder")
-            .with_name("NumericEdit")
-            .with_child(
-                InstanceBuilder::new("Folder")
-                    .with_name("Settings")
-                    .with_property("Attributes", attributes),
-            ),
-    );
-    rbx_xml::to_writer_default(
-        fs_err::File::create(&input).unwrap(),
-        &dom,
-        &[dom.root_ref()],
-    )
-    .unwrap();
+        let mut attributes = Attributes::new();
+        attributes.insert("Speed".into(), next.clone());
+        let dom = WeakDom::new(
+            InstanceBuilder::new("Folder")
+                .with_name("NumericEdit")
+                .with_child(
+                    InstanceBuilder::new("Folder")
+                        .with_name("Settings")
+                        .with_property("Attributes", attributes),
+                ),
+        );
+        rbx_xml::to_writer_default(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            &[dom.root_ref()],
+        )
+        .unwrap();
 
-    let run = || {
-        Command::new(ROJO_PATH)
-            .arg("syncback")
-            .arg(&project)
-            .arg("--input")
-            .arg(&input)
-            .args(["--non-interactive", "--list"])
-            .output()
-            .unwrap()
-    };
-    let output = run();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        let run = || {
+            Command::new(ROJO_PATH)
+                .arg("syncback")
+                .arg(&project)
+                .arg("--input")
+                .arg(&input)
+                .args(["--non-interactive", "--list"])
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    let result: serde_json::Value =
-        serde_json::from_slice(&fs_err::read(&metadata).unwrap()).unwrap();
-    assert_eq!(result["attributes"]["Speed"], 0.14);
+        let vfs = memofs::Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let rebuilt =
+            librojo::snapshot_from_vfs(&librojo::InstanceContext::default(), &vfs, &project)
+                .unwrap()
+                .unwrap();
+        let settings = rebuilt
+            .children
+            .iter()
+            .find(|child| child.name == "Settings")
+            .unwrap();
+        let Some(Variant::Attributes(attributes)) = settings.properties.get(&"Attributes".into())
+        else {
+            panic!("rebuilt settings must have attributes");
+        };
+        assert_eq!(attributes.get("Speed"), Some(&next));
 
-    let output = run();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "syncback should converge after the edit"
-    );
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "syncback should converge after the edit"
+        );
+    }
 }
 
 #[test]
