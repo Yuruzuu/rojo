@@ -30,19 +30,19 @@ pub fn name_for_inst<'old>(
             );
         }
     } else {
+        let name = &new_inst.name;
+        validate_new_file_name(name)
+            .with_context(|| format!("name '{name}' is not legal to write to the file system"))?;
+
         Ok(match middleware {
             Middleware::Dir
             | Middleware::CsvDir
             | Middleware::ServerScriptDir
             | Middleware::ClientScriptDir
             | Middleware::PluginScriptDir
-            | Middleware::ModuleScriptDir => Cow::Owned(new_inst.name.clone()),
+            | Middleware::ModuleScriptDir => Cow::Owned(name.clone()),
             _ => {
                 let extension = extension_for_middleware(middleware);
-                let name = &new_inst.name;
-                validate_file_name(name).with_context(|| {
-                    format!("name '{name}' is not legal to write to the file system")
-                })?;
                 Cow::Owned(format!("{name}.{extension}"))
             }
         })
@@ -92,6 +92,10 @@ const INVALID_WINDOWS_NAMES: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+const ADDITIONAL_WINDOWS_DEVICE_NAMES: [&str; 8] = [
+    "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³", "CONIN$", "CONOUT$",
+];
+
 /// A list of all characters that are outright forbidden to be included
 /// in a file's name.
 const FORBIDDEN_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '|', '?', '*', '\\'];
@@ -127,4 +131,143 @@ pub fn validate_file_name<S: AsRef<str>>(name: S) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// Apply stricter portability checks only to new paths. Existing source names
+// may be valid on their host filesystem despite Windows device restrictions.
+fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
+    validate_file_name(name)?;
+    if name.is_empty() {
+        anyhow::bail!("file names cannot be empty")
+    }
+
+    // Windows also treats device stems followed by an extension as devices.
+    let stem = name.split('.').next().unwrap().trim_end_matches(' ');
+    for forbidden in INVALID_WINDOWS_NAMES
+        .into_iter()
+        .chain(ADDITIONAL_WINDOWS_DEVICE_NAMES)
+    {
+        if stem.eq_ignore_ascii_case(forbidden) {
+            anyhow::bail!("files cannot be named {name}")
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::Path;
+
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+    use crate::snapshot::{InstanceMetadata, InstanceSnapshot, RojoTree};
+
+    use super::*;
+
+    const MIDDLEWARES: [Middleware; 11] = [
+        Middleware::Dir,
+        Middleware::CsvDir,
+        Middleware::ServerScriptDir,
+        Middleware::ClientScriptDir,
+        Middleware::PluginScriptDir,
+        Middleware::ModuleScriptDir,
+        Middleware::Csv,
+        Middleware::ServerScript,
+        Middleware::ClientScript,
+        Middleware::PluginScript,
+        Middleware::ModuleScript,
+    ];
+
+    #[test]
+    fn new_file_and_directory_names_reject_invalid_components() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escaped",
+            r"..\escaped",
+            "/absolute",
+            r"C:\absolute",
+            "trailing.",
+            "trailing ",
+            "colon:name",
+            "control\0name",
+        ] {
+            let tree = WeakDom::new(InstanceBuilder::new("Folder").with_name(name));
+            for middleware in MIDDLEWARES {
+                assert!(
+                    name_for_inst(middleware, tree.root(), None).is_err(),
+                    "accepted {name:?} with {middleware:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_device_names_are_reserved_with_any_case_or_extension() {
+        for device in INVALID_WINDOWS_NAMES
+            .into_iter()
+            .chain(ADDITIONAL_WINDOWS_DEVICE_NAMES)
+        {
+            for stem in [device.to_owned(), device.to_lowercase()] {
+                for name in [stem.clone(), format!("{stem}.txt"), format!("{stem} .luau")] {
+                    let tree = WeakDom::new(InstanceBuilder::new("Folder").with_name(&name));
+                    for middleware in MIDDLEWARES {
+                        assert!(
+                            name_for_inst(middleware, tree.root(), None).is_err(),
+                            "accepted {name:?} with {middleware:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_components_keep_their_names() {
+        for name in [
+            "Worker",
+            "init.server",
+            ".hidden",
+            "conifer",
+            "COM10",
+            "LPT10.txt",
+        ] {
+            let tree = WeakDom::new(InstanceBuilder::new("Folder").with_name(name));
+            for middleware in MIDDLEWARES {
+                let expected = if middleware.is_dir() {
+                    name.to_owned()
+                } else {
+                    format!("{name}.{}", extension_for_middleware(middleware))
+                };
+                assert_eq!(
+                    name_for_inst(middleware, tree.root(), None).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn existing_sources_keep_their_names_without_revalidation() {
+        let new_tree = WeakDom::new(InstanceBuilder::new("Folder").with_name("../escaped"));
+        for source in ["con.txt", "Old.modulescript", "Existing Directory"] {
+            let old_tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Original")
+                    .class_name("Folder")
+                    .metadata(
+                        InstanceMetadata::new()
+                            .relevant_paths(vec![Path::new("/src").join(source)]),
+                    ),
+            );
+            for middleware in MIDDLEWARES {
+                assert_eq!(
+                    name_for_inst(middleware, new_tree.root(), Some(old_tree.root())).unwrap(),
+                    source
+                );
+            }
+        }
+    }
 }

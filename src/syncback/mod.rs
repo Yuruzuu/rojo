@@ -355,7 +355,34 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
         }
     }
 
-    if !inst.children().is_empty() {
+    // Init files describe their containing directory instead of a child, so
+    // new children with those file names need a directory of their own.
+    // Case variants alias those files on case-insensitive file systems.
+    let reserved_init_name = snapshot.old.is_none()
+        && matches!(
+            middleware,
+            Middleware::ServerScript
+                | Middleware::ClientScript
+                | Middleware::PluginScript
+                | Middleware::ModuleScript
+                | Middleware::Csv
+        )
+        && matches!(
+            format!("{}.{}", inst.name, extension_for_middleware(middleware))
+                .to_ascii_lowercase()
+                .as_str(),
+            "init.lua"
+                | "init.luau"
+                | "init.server.lua"
+                | "init.server.luau"
+                | "init.client.lua"
+                | "init.client.luau"
+                | "init.plugin.lua"
+                | "init.plugin.luau"
+                | "init.csv"
+        );
+
+    if !inst.children().is_empty() || reserved_init_name {
         middleware = match middleware {
             Middleware::ServerScript => Middleware::ServerScriptDir,
             Middleware::ClientScript => Middleware::ClientScriptDir,
@@ -547,7 +574,301 @@ fn strip_unknown_root_children(new: &mut WeakDom, old: &RojoTree) {
 
 #[cfg(test)]
 mod test {
+    use rbx_dom_weak::InstanceBuilder;
+
+    use crate::{
+        snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot},
+        snapshot_middleware::snapshot_from_vfs,
+    };
+
     use super::*;
+
+    fn syncback_fixture(
+        existing_init: Option<&str>,
+    ) -> (tempfile::TempDir, Vfs, Project, RojoTree) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(directory.path()).unwrap();
+        fs_err::create_dir(root.join("src")).unwrap();
+        fs_err::write(
+            root.join("default.project.json"),
+            r#"{"name":"Root","emitLegacyScripts":true,"tree":{"$path":"src"}}"#,
+        )
+        .unwrap();
+        if let Some(init) = existing_init {
+            fs_err::create_dir(root.join("src/Worker")).unwrap();
+            fs_err::write(root.join("src/Worker").join(init), "return 'old source'\n").unwrap();
+        }
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project = Project::load_exact(&vfs, &root.join("default.project.json"), None).unwrap();
+        let tree = rebuild_project(&vfs, &project);
+
+        (directory, vfs, project, tree)
+    }
+
+    fn rebuild_project(vfs: &Vfs, project: &Project) -> RojoTree {
+        RojoTree::new(
+            snapshot_from_vfs(&InstanceContext::default(), vfs, &project.file_location)
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn syncback_rejects_directory_traversal_before_planning_writes() {
+        let (_directory, vfs, project, mut old_tree) = syncback_fixture(None);
+        let escaped = project.folder_location().join("escaped");
+        vfs.create_dir_all(&escaped).unwrap();
+        let victim = escaped.join("victim.txt");
+        vfs.write(&victim, b"original").unwrap();
+        let new_tree = WeakDom::new(
+            InstanceBuilder::new("Folder").with_name("Root").with_child(
+                InstanceBuilder::new("Folder")
+                    .with_name("../escaped")
+                    .with_child(
+                        InstanceBuilder::new("StringValue")
+                            .with_name("victim")
+                            .with_property("Value", "overwritten"),
+                    ),
+            ),
+        );
+
+        let error = syncback_loop(&vfs, &mut old_tree, new_tree, &project)
+            .err()
+            .expect("a new directory cannot escape its parent");
+        assert!(format!("{error:#}").contains("name '../escaped' is not legal"));
+        assert_eq!(vfs.read_to_string(&victim).unwrap().as_str(), "original");
+    }
+
+    #[test]
+    fn reserved_init_children_preserve_sources_and_structure_after_syncback_and_build() {
+        let parent_source = "return 'parent source'\n";
+        let child_source = "return 'child source'\n";
+        let table_contents =
+            r#"[{"key":"Child","source":"Child source","values":{"en":"Child translation"}}]"#;
+        for (class, name, property, contents, init_name) in [
+            ("ModuleScript", "init", "Source", child_source, "init.luau"),
+            ("ModuleScript", "Init", "Source", child_source, "init.luau"),
+            (
+                "ModuleScript",
+                "init.server",
+                "Source",
+                child_source,
+                "init.luau",
+            ),
+            (
+                "ModuleScript",
+                "init.client",
+                "Source",
+                child_source,
+                "init.luau",
+            ),
+            (
+                "ModuleScript",
+                "INIT.Server",
+                "Source",
+                child_source,
+                "init.luau",
+            ),
+            (
+                "ModuleScript",
+                "init.plugin",
+                "Source",
+                child_source,
+                "init.luau",
+            ),
+            ("Script", "init", "Source", child_source, "init.server.luau"),
+            ("Script", "INIT", "Source", child_source, "init.server.luau"),
+            (
+                "LocalScript",
+                "init",
+                "Source",
+                child_source,
+                "init.client.luau",
+            ),
+            (
+                "LocalizationTable",
+                "init",
+                "Contents",
+                table_contents,
+                "init.csv",
+            ),
+            (
+                "LocalizationTable",
+                "Init",
+                "Contents",
+                table_contents,
+                "init.csv",
+            ),
+        ] {
+            for (parent_class, existing_init) in [
+                ("Folder", None),
+                ("ModuleScript", None),
+                ("ModuleScript", Some("init.lua")),
+                ("ModuleScript", Some("init.luau")),
+            ] {
+                let (_directory, vfs, project, mut old_tree) = syncback_fixture(existing_init);
+                let mut parent = InstanceBuilder::new(parent_class)
+                    .with_name("Worker")
+                    .with_child(
+                        InstanceBuilder::new(class)
+                            .with_name(name)
+                            .with_property(property, contents),
+                    );
+                if parent_class == "ModuleScript" {
+                    parent = parent.with_property("Source", parent_source);
+                }
+                let new_tree = WeakDom::new(
+                    InstanceBuilder::new("Folder")
+                        .with_name("Root")
+                        .with_child(parent),
+                );
+
+                let fs_snapshot = syncback_loop(&vfs, &mut old_tree, new_tree, &project)
+                    .unwrap_or_else(|error| {
+                        panic!("{parent_class}/{class} {name} with {existing_init:?}: {error:#}")
+                    });
+                fs_snapshot
+                    .write_to_vfs(project.folder_location(), &vfs)
+                    .unwrap();
+                let worker_path = project.folder_location().join("src/Worker");
+                assert!(vfs.exists(worker_path.join(name).join(init_name)).unwrap());
+                if parent_class == "ModuleScript" {
+                    let path = worker_path.join(existing_init.unwrap_or("init.luau"));
+                    assert_eq!(vfs.read_to_string(path).unwrap().as_str(), parent_source);
+                }
+
+                let rebuilt = rebuild_project(&vfs, &project);
+                assert_eq!(rebuilt.root().children().len(), 1);
+                let parent = rebuilt.get_instance(rebuilt.root().children()[0]).unwrap();
+                assert_eq!(parent.name(), "Worker");
+                assert_eq!(parent.class_name().as_str(), parent_class);
+                if parent_class == "ModuleScript" {
+                    assert_eq!(
+                        parent.properties().get(&ustr("Source")),
+                        Some(&Variant::String(parent_source.to_owned()))
+                    );
+                }
+                assert_eq!(parent.children().len(), 1);
+                let child = rebuilt.get_instance(parent.children()[0]).unwrap();
+                assert_eq!(child.name(), name);
+                assert_eq!(child.class_name().as_str(), class);
+                assert!(child.children().is_empty());
+                if property == "Contents" {
+                    let Some(Variant::String(rebuilt_contents)) =
+                        child.properties().get(&ustr(property))
+                    else {
+                        panic!("rebuilt LocalizationTable must have Contents");
+                    };
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(rebuilt_contents).unwrap(),
+                        serde_json::from_str::<serde_json::Value>(contents).unwrap()
+                    );
+                } else {
+                    assert_eq!(
+                        child.properties().get(&ustr(property)),
+                        Some(&Variant::String(contents.to_owned()))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_and_explicit_middleware_are_preserved_for_reserved_names() {
+        let (_directory, vfs, project, _) = syncback_fixture(None);
+        for middleware in [
+            Middleware::ModuleScript,
+            Middleware::ServerScript,
+            Middleware::ClientScript,
+            Middleware::PluginScript,
+            Middleware::Csv,
+        ] {
+            let old_tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("init")
+                    .class_name("ModuleScript")
+                    .metadata(InstanceMetadata::new().middleware(middleware)),
+            );
+            let new_tree = WeakDom::new(InstanceBuilder::new("ModuleScript").with_name("init"));
+            let mut snapshot = SyncbackSnapshot {
+                data: SyncbackData {
+                    vfs: &vfs,
+                    old_tree: &old_tree,
+                    new_tree: &new_tree,
+                    project: &project,
+                },
+                old: Some(old_tree.get_root_id()),
+                new: new_tree.root_ref(),
+                path: project.folder_location().join("src/unchanged"),
+                middleware: None,
+            };
+            assert_eq!(get_best_middleware(&snapshot), middleware);
+
+            snapshot.old = None;
+            snapshot.middleware = Some(middleware);
+            assert_eq!(get_best_middleware(&snapshot), middleware);
+        }
+    }
+
+    #[test]
+    fn ordinary_new_leaf_names_keep_file_middleware() {
+        let (_directory, vfs, project, old_tree) = syncback_fixture(None);
+        for (class, name, expected) in [
+            ("ModuleScript", "Worker", Middleware::ModuleScript),
+            ("ModuleScript", "initialize", Middleware::ModuleScript),
+            ("ModuleScript", "init.csv", Middleware::ModuleScript),
+            ("Script", "init.server", Middleware::ServerScript),
+            ("LocalScript", "init.client", Middleware::ClientScript),
+            ("LocalizationTable", "init.csv", Middleware::Csv),
+        ] {
+            let new_tree = WeakDom::new(InstanceBuilder::new(class).with_name(name));
+            let snapshot = SyncbackSnapshot {
+                data: SyncbackData {
+                    vfs: &vfs,
+                    old_tree: &old_tree,
+                    new_tree: &new_tree,
+                    project: &project,
+                },
+                old: None,
+                new: new_tree.root_ref(),
+                path: project.folder_location().join("src/unused"),
+                middleware: None,
+            };
+            assert_eq!(get_best_middleware(&snapshot), expected, "{class} {name}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn existing_windows_device_name_roundtrips_on_other_platforms() {
+        let (_directory, vfs, project, _) = syncback_fixture(None);
+        let path = project.folder_location().join("src/con.txt");
+        vfs.write(&path, "original").unwrap();
+        let mut old_tree = rebuild_project(&vfs, &project);
+        let new_tree = WeakDom::new(
+            InstanceBuilder::new("Folder").with_name("Root").with_child(
+                InstanceBuilder::new("StringValue")
+                    .with_name("con")
+                    .with_property("Value", "updated"),
+            ),
+        );
+
+        let fs_snapshot = syncback_loop(&vfs, &mut old_tree, new_tree, &project).unwrap();
+        fs_snapshot
+            .write_to_vfs(project.folder_location(), &vfs)
+            .unwrap();
+        assert_eq!(vfs.read_to_string(&path).unwrap().as_str(), "updated");
+        let rebuilt = rebuild_project(&vfs, &project);
+        assert_eq!(rebuilt.root().children().len(), 1);
+        let child = rebuilt.get_instance(rebuilt.root().children()[0]).unwrap();
+        assert_eq!(child.name(), "con");
+        assert_eq!(child.class_name().as_str(), "StringValue");
+        assert_eq!(
+            child.properties().get(&ustr("Value")),
+            Some(&Variant::String("updated".to_owned()))
+        );
+    }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {
         SyncbackRules {
